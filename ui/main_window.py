@@ -29,10 +29,12 @@ from PyQt6.QtGui import (QAction, QFont, QTextOption, QIcon, QPixmap, QPainter,
 
 from core.config import (
     ConfigManager, save_scan_path, load_scan_path, save_language,
-    get_server_path, save_server_path, load_server_path,
+    save_server_path, load_server_path,
     save_ui_prefs, load_ui_prefs, save_ui_pref,
     load_theme, save_theme,
     load_last_preset, save_last_preset,
+    save_preferred_engine_id,
+    LLAMA_ENGINE_ID,
     CONFIG_DIR, LOGS_DIR, LAST_RUN_LOG,
 )
 from core.constants import (
@@ -47,7 +49,8 @@ from ui.log_parser import colorize_log_line, parse_log_line, line_level
 from ui.command_builder import CommandBuilder, quote_arg
 from ui.runtime_info import build_info_html, empty_info_html
 from core.runner import ServerRunner
-from core import params_schema
+from core import engine as engine_mod
+from core import kvmem_identity
 from core.i18n import t, get_language, set_language
 from ui.model_browser import ModelBrowser
 from ui.basic_panel import BasicPanel, ElidingLabel
@@ -234,17 +237,34 @@ _active_startup_workers: set = set()
 
 
 class _StartupInfoWorker(QThread):
-    """Fetch llama-server version and --help off the main thread (plan A10).
+    """Ask the *engine's* binary who it is, off the main thread (plan A10).
 
     The window is shown immediately with fallback defaults; when this worker
     finishes, the live-parsed defaults / chat templates are merged into the
     window via _apply_startup_defaults(), so startup no longer blocks on the
     subprocess.
+
+    Being engine-aware is not abstraction for its own sake — the two engines
+    differ in what it is *legal* to ask:
+
+      * llama.cpp answers ``--version``; kvmem-llama.cpp rejects the flag
+        (``unknown flag`` + exit 1), so its version comes from the identity
+        file next to the install (core/kvmem_identity.py) and is display-only.
+      * llama.cpp supports ``--list-devices``; kvmem does not, so the GPU
+        layer-count hint is never computed for it.
+      * ``--help`` is the one probe both engines answer, and even that differs
+        in *parsing* (which is the defaults module's job, not this one).
     """
     version_ready = pyqtSignal(str, str, str)  # version_num, commit, raw_line
-    version_failed = pyqtSignal(str)  # error_type: "not_found", "no_version", "error"
+    #: not_found / no_version / no_identity / error
+    version_failed = pyqtSignal(str)
     defaults_ready = pyqtSignal(dict, list)  # defaults, chat_templates
     devices_ready = pyqtSignal(list)  # E8: list of device dicts (may be empty = CPU-only)
+
+    def __init__(self, engine=None, parent=None):
+        super().__init__(parent)
+        self.engine = engine or engine_mod.LLAMA
+        self.server_path = ""
 
     def run(self):
         _active_startup_workers.add(self)
@@ -255,7 +275,10 @@ class _StartupInfoWorker(QThread):
 
     def _run_body(self):
         # E1: resolved path (settings > PATH > bare name)
-        self.server_path = get_server_path()
+        self.server_path = self.engine.server_path()
+        if not self.engine.probe_version:
+            self._run_identity_probes()
+            return
         try:
             result = subprocess.run(
                 [self.server_path, "--version"],
@@ -294,18 +317,34 @@ class _StartupInfoWorker(QThread):
         # --help (up to 10s, off the main thread)
         self._emit_defaults()
 
+    def _run_identity_probes(self):
+        """Engine with no ``--version``: read the build identity off the tree."""
+        if not self.server_path or not Path(self.server_path).is_file():
+            self.version_failed.emit("not_found")
+            return  # nothing to parse --help out of either
+        identity = self.engine.identity(self.server_path)
+        describe = self.engine.describe_identity or (lambda i: "")
+        text = describe(identity)
+        if text:
+            self.version_ready.emit("", "", text)
+        else:
+            # Hand-built install: the version stays unknown, but --help is
+            # still worth reading — drift detection needs no version.
+            self.version_failed.emit("no_identity")
+        self._emit_defaults()
+
     def _emit_defaults(self):
         try:
-            from core.defaults import fetch_help_text, get_default_params, get_chat_templates
-            help_text = fetch_help_text(server_path=self.server_path)
+            from core.defaults import fetch_help_text
+            help_text = fetch_help_text(server_path=self.server_path or None)
             if help_text and help_text.strip():
                 self.defaults_ready.emit(
-                    get_default_params(help_text=help_text),
-                    get_chat_templates(help_text=help_text),
+                    self.engine.get_default_params(help_text=help_text),
+                    self.engine.get_chat_templates(help_text=help_text),
                 )
                 # E8: probe the actual GPU devices (only when this build has
                 # the flag; older versions skip silently)
-                if "--list-devices" in help_text:
+                if self.engine.probe_devices and "--list-devices" in help_text:
                     try:
                         from core.defaults import parse_device_list
                         probe = subprocess.run(
@@ -356,10 +395,20 @@ class _ModelMetaWorker(QThread):
             self.finished_err.emit(self._seq, str(e))
 
 
+#: A window built by an engine switch, held here until the old window has
+#: closed: Python would otherwise drop the only reference mid-closeEvent and
+#: Qt would destroy the widget while it is still being shown.
+_pending_engine_windows: list = []
+
+
 class MainWindow(QMainWindow):
     def __init__(self, work_dir=None, defaults=None, chat_templates=None,
-                 theme=None, schema=None):
+                 theme=None, schema=None, engine=None):
         super().__init__()
+        #: Which server binary this window drives (a core.engine.Engine).
+        #: None = the llama.cpp engine, i.e. the pre-kvmem behaviour exactly.
+        self.engine = engine or engine_mod.LLAMA
+        self.engine_id = self.engine.id
         # E5: theme ("light"/"dark"), persisted in settings.json
         self.theme = theme if theme in ("light", "dark") else load_theme()
         self.work_dir = Path(work_dir) if work_dir else Path.cwd()
@@ -368,18 +417,20 @@ class MainWindow(QMainWindow):
             self.model_dir = Path(saved_scan_path)
         else:
             self.model_dir = self.work_dir
-        self.defaults = defaults or {}
+        self.defaults = defaults or self.engine.fallback_defaults()
         # Engine seam: one parameter module drives the builder, the panels and
         # the presets. Defaults to core.params_schema (llama.cpp), so the
         # command line and the UI are byte-for-byte what they were.
-        self._schema = schema or params_schema
+        self._schema = schema or self.engine.schema
         self.cmd_builder = CommandBuilder(self.defaults, params=self._schema.PARAMS)
         self._version_checked = False
         self.chat_templates = chat_templates or []
-        self.config = ConfigManager(defaults=self.defaults, schema=self._schema)
+        self.config = ConfigManager(defaults=self.defaults, schema=self._schema,
+                                    engine_id=self.engine_id)
         self.runner = ServerRunner()
         self.is_advanced = False
         self.params = dict(self.defaults)
+        self._seed_recipe_values()
         self.params_history = [dict(self.params)]
         self.max_history = UNDO_HISTORY_MAX
         self._last_saved = dict(self.params)
@@ -444,11 +495,36 @@ class MainWindow(QMainWindow):
         self._runtime_info = {}
         self._current_state = None
         self._mode_switching = False
+        # Engine switch (设置 → 引擎) rebuilds the window: the flag keeps
+        # closeEvent from taking the event loop down with the old window.
+        self._switching_engine = False
         self.init_ui()
         self._connect_signals()
         self._restore_ui_state()
+        if self.engine.initial_overrides():
+            # The panels build their widgets from each Param's own default, and
+            # the first preview tick reads those widgets back into params — so
+            # an engine recipe seeded into params before init_ui() is erased
+            # again (including --port 18200). Re-seed and push to the widgets.
+            # llama.cpp has no overrides, so its construction path gains no call.
+            self._seed_recipe_values()
+            self._apply_params_to_current()
+            self.params_history[0] = dict(self.params)
+            self._last_saved = dict(self.params)
+            self._pending_snapshot = False
         self._restore_last_preset()
         self._check_server_info()
+
+    def _seed_recipe_values(self):
+        """Overlay the engine's starter recipe onto self.params.
+
+        Values only — self.defaults stays the binary's own baseline, which is
+        what makes each recipe item an actual emission (is_default() is the
+        gate) while a preset diff still means "changed vs. the server default".
+        """
+        for key, value in self.engine.initial_overrides().items():
+            if key in self._schema.PARAMS_BY_KEY:
+                self.params[key] = value
 
     @staticmethod
     def _default_window_size():
@@ -480,8 +556,36 @@ class MainWindow(QMainWindow):
         left = max(300, min(400, content - 900))
         return [left, max(100, content - left)]
 
+    def _window_title(self):
+        """Title-bar text. The engine suffix only appears for a second engine,
+        so a llama.cpp window is titled exactly as it always was."""
+        base = f"🦙 llama.cpp Launcher v{APP_VERSION}"
+        if self.engine.id == LLAMA_ENGINE_ID:
+            return base
+        return f"{base} · {self.engine.display_name}"
+
+    def _server_path_menu_text(self):
+        """文件 → "设置 … 路径…" label: named after this engine's binary."""
+        if self.engine.id == LLAMA_ENGINE_ID:
+            return t("设置 llama-server 路径...")
+        return t("设置 {engine} 路径...", engine=self.engine.display_name)
+
+    # ------------------------------------------------------------------
+    # Server binary for *this* engine (E1 generalised to two engines)
+    # ------------------------------------------------------------------
+
+    def _server_binary(self) -> str:
+        """Path this engine would run; "" when it needs an explicit one and
+        has none (kvmem never guesses off PATH — see Engine.server_path)."""
+        return self.engine.server_path()
+
+    def _server_for_display(self) -> str:
+        """Same, but never empty: the command preview keeps showing a bare
+        binary name for an unconfigured engine, like llama.cpp's last resort."""
+        return self._server_binary() or self.engine.bare_name()
+
     def init_ui(self):
-        self.setWindowTitle(f"🦙 llama.cpp Launcher v{APP_VERSION}")
+        self.setWindowTitle(self._window_title())
         # E12: objectName drives the frameless chrome QSS (1px border on
         # the transparent top level) — see _THEME_TEMPLATE.
         self.setObjectName("llamaMainWin")
@@ -770,6 +874,21 @@ class MainWindow(QMainWindow):
 
         self.stacked_layout.addWidget(self.basic_panel)
         self.stacked_layout.addWidget(self.advanced_panel)
+
+        if not self.engine.has_basic_mode:
+            # The basic form is a fixed set of llama.cpp controls, so a second
+            # engine starts in advanced mode and never shows the switch (see
+            # Engine.has_basic_mode for why it would emit wrong flags).
+            # Set without firing currentIndexChanged: _on_mode_changed reads
+            # widgets and timers that construction has not created yet.
+            self.mode_label.setVisible(False)
+            self.mode_combo.setVisible(False)
+            self.mode_combo.blockSignals(True)
+            self.mode_combo.setCurrentIndex(1)
+            self.mode_combo.blockSignals(False)
+            self.is_advanced = True
+            self.basic_panel.hide()
+            self.advanced_panel.show()
 
         # E11: the parameter area never scrolls vertically. The basic panel
         # carries a hard minimum height equal to its natural height (see
@@ -1098,11 +1217,39 @@ class MainWindow(QMainWindow):
         self.runner.state_changed.connect(self._on_state_changed)
         self.runner.error_occurred.connect(self._on_error)
         self.basic_panel.chk_webui.stateChanged.connect(self._update_webui_button)
-        self.advanced_panel.adv_webui.stateChanged.connect(self._update_webui_button)
+        # The "does the server serve a UI" checkbox is a different parameter per
+        # engine (llama.cpp: --webui, kvmem: --no-ui, inverted), and the panel
+        # only owns widgets its schema names — so resolve it through the table.
+        widget = self._ui_toggle_widget()
+        if widget is not None:
+            widget.stateChanged.connect(self._update_webui_button)
         self.basic_panel.ctx_spin.valueChanged.connect(self._update_model_info)
         self.advanced_panel.adv_ctx_size.valueChanged.connect(self._update_model_info)
         self._update_cmd_preview()
         self.btn_webui.setEnabled(False)
+
+    def _ui_toggle_widget(self):
+        """The advanced-panel checkbox behind "Open Web UI", or None."""
+        for key in ("webui", "no_ui"):
+            p = getattr(self._schema, "PARAMS_BY_KEY", {}).get(key)
+            if p is None or not p.wattr:
+                continue
+            widget = getattr(self.advanced_panel, p.wattr, None)
+            if widget is not None:
+                return widget
+        return None
+
+    def _webui_served(self, values) -> bool:
+        """Would the running server answer requests for its bundled UI?
+
+        llama.cpp has `--webui` (default on, emitted as `--no-webui` when
+        unticked); kvmem has the inverted `--no-ui` and no `webui` key at all,
+        so reading `values["webui"]` there would answer "no UI" for a server
+        that always has one.
+        """
+        if "webui" in values:
+            return bool(values.get("webui", True))
+        return not bool(values.get("no_ui", False))
 
     def _on_model_selected(self, path):
         if self.is_advanced:
@@ -1209,7 +1356,7 @@ class MainWindow(QMainWindow):
             self._undo_debounce.start(UNDO_DEBOUNCE_MS)
         args = self._build_args_from_params()
         # E1: show the real executable (configured path > PATH); cached, no IO per tick
-        cmd_path = quote_arg(get_server_path())
+        cmd_path = quote_arg(self._server_for_display())
         new_text = cmd_path + (" " + " ".join(quote_arg(a) for a in args) if args else "")
         # B1: only touch the widget when the text actually changed — rebuilding
         # the document on every 300ms tick forced pointless relayout/repaints
@@ -1313,6 +1460,45 @@ class MainWindow(QMainWindow):
             self.btn_undo.setEnabled(len(self.params_history) > 1)
         self._pending_snapshot = False
 
+    def _engine_validation_problems(self, values):
+        """Values this engine's parser would reject ([] = nothing to check).
+
+        kvmem validates almost nothing and exits 1 when it does, so the last
+        readable line before the process dies can be a plain `unknown flag` —
+        this is the place that turns that into "which parameter, and where to
+        change it". The rules live in the engine's schema module.
+        """
+        return self.engine.validation_problems(values)
+
+    def _show_validation_dialog(self, problems):
+        """Refuse to start, naming each parameter and opening its tab."""
+        param_keys = getattr(self._schema, "PARAMS_BY_KEY", {})
+        lines = []
+        for key, reason in problems:
+            param = param_keys.get(key)
+            label = t(param.label) if param is not None and param.label else key
+            lines.append(t("{label}: {reason}", label=label, reason=t(reason)))
+        box = ThemedMessageBox(self)
+        box.setWindowTitle(t("参数与引擎不兼容"))
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setText(t("{engine}: 有 {n} 项参数会被服务器拒绝，已阻止启动",
+                      engine=self.engine.display_name, n=len(problems)))
+        box.setInformativeText("\n".join(lines[:6]))
+        box.setDetailedText("\n".join(lines))
+        # Jump straight at the first offender (advanced mode owns the tabs) so
+        # the fix is a keystroke away rather than a hunt through six tabs.
+        first = param_keys.get(problems[0][0])
+        if first is not None and first.tab:
+            self.mode_combo.setCurrentIndex(1)
+            keys = self.advanced_panel.tab_keys()
+            if first.tab in keys:
+                self.advanced_panel.tabs.setCurrentIndex(keys.index(first.tab))
+        box.exec()
+        box.deleteLater()  # don't leave a hidden top-level behind
+        self.statusBar().showMessage(
+            t("已阻止启动：{n} 项参数与 {engine} 不兼容",
+              n=len(problems), engine=self.engine.display_name), 8000)
+
     def _start_server(self):
         v = self._get_current_values()
         if not v.get("model"):
@@ -1330,6 +1516,23 @@ class MainWindow(QMainWindow):
             ThemedMessageBox.warning(self, t("警告"), t("模型文件不存在:\n{model_path}", model_path=model_path))
             return False
 
+        # Two more refusals before anything is spawned, both engine-driven:
+        #   * the binary — kvmem has no PATH fallback, so an unconfigured
+        #     engine must say so rather than fail inside QProcess;
+        #   * the engine's own invariants, because kvmem answers a bad value
+        #     with exit 1 (or silently ignores it) and that reads as a crash.
+        binary = self._server_binary()
+        if not binary:
+            ThemedMessageBox.warning(
+                self, t("未配置服务器路径"),
+                t("尚未配置 {engine} 的可执行文件路径。\n请在「文件 → 设置服务器路径…」中指定。",
+                  engine=self.engine.display_name))
+            return False
+        problems = self._engine_validation_problems(v)
+        if problems:
+            self._show_validation_dialog(problems)
+            return False
+
         host = v.get('host', '127.0.0.1')
         port = v.get("port", 8080)
         # A7: probe the host that will actually be bound. 0.0.0.0/:: accept
@@ -1345,7 +1548,7 @@ class MainWindow(QMainWindow):
                 return False
 
         args = self._build_args_from_params()
-        cmd_path = quote_arg(get_server_path())
+        cmd_path = quote_arg(binary)
         cmd_str = cmd_path + (" " + " ".join(quote_arg(a) for a in args) if args else "")
         timestamp = datetime.now().strftime('%H:%M:%S')
         # E3: banners go through the record system so they survive filter
@@ -1357,7 +1560,7 @@ class MainWindow(QMainWindow):
         )
         self._log_banner("")
 
-        self.runner.start(args, work_dir=str(self.work_dir))
+        self.runner.start(args, work_dir=str(self.work_dir), server_path=binary)
         msg = t("🔄 正在启动服务: http://{host}:{port}", host=host, port=port)
         if host == "0.0.0.0":
             msg += t("  ⚠️ 监听所有网卡，局域网可访问")
@@ -1373,7 +1576,7 @@ class MainWindow(QMainWindow):
     def _copy_command(self):
         self._save_current_to_params()
         args = self._build_args_from_params()
-        cmd_path = quote_arg(get_server_path())
+        cmd_path = quote_arg(self._server_for_display())
         cmd = cmd_path + (" " + " ".join(quote_arg(a) for a in args) if args else "")
         QApplication.clipboard().setText(cmd)
         self.statusBar().showMessage(t("命令已复制到剪贴板"), 2000)
@@ -1475,7 +1678,7 @@ class MainWindow(QMainWindow):
 
     def _update_webui_button(self):
         v = self._get_current_values()
-        if self.runner.is_ready and v.get("webui", True):
+        if self.runner.is_ready and self._webui_served(v):
             self.btn_webui.setEnabled(True)
         else:
             self.btn_webui.setEnabled(False)
@@ -1923,7 +2126,7 @@ class MainWindow(QMainWindow):
         if not params:
             return
         if isinstance(params, dict):
-            save_last_preset(name)  # remember for the next startup
+            save_last_preset(name, self.engine_id)  # remember for the next startup
             # A9: presets often travel between machines — clear machine-local
             # paths that do not exist here instead of starting with broken ones
             missing = []
@@ -1957,12 +2160,12 @@ class MainWindow(QMainWindow):
         startup worker finishes.
         """
         try:
-            name = load_last_preset()
+            name = load_last_preset(self.engine_id)
             if not name:
                 return
             if not any(p["name"] == name for p in self.config.list_presets()):
                 # Stale pointer: the preset was deleted (or hand-edited away)
-                save_last_preset("")
+                save_last_preset("", self.engine_id)
                 return
             params = self.config.load_preset(name)
             if not isinstance(params, dict):
@@ -2130,20 +2333,63 @@ class MainWindow(QMainWindow):
             save_scan_path(d)
             self.statusBar().showMessage(t("扫描路径已更改为: {path}", path=d), 3000)
 
+    def _verify_server_binary(self, path):
+        """(verified, detail): is `path` a server *this* engine can drive?
+
+        llama.cpp is asked directly — `--version` is a legal probe. kvmem
+        rejects that flag with exit 1, so it is identified by its --help
+        fingerprint instead, which also catches the case that actually bites
+        people: pointing an engine at the other engine's binary. The answer
+        then names the engine that binary really belongs to, instead of the
+        `unknown flag` + exit 1 the server would produce minutes later.
+        """
+        target = Path(path)
+        if not target.is_file():
+            return False, t("文件不存在")
+        try:
+            if self.engine.probe_version:
+                result = subprocess.run(
+                    [path, "--version"],
+                    capture_output=True, text=True, timeout=10,
+                    encoding="utf-8", errors="replace",
+                )
+                return (result.returncode == 0
+                        and bool((result.stdout + result.stderr).strip())), ""
+            probe = subprocess.run(
+                [path, "--help"],
+                capture_output=True, text=True, timeout=20,
+                encoding="utf-8", errors="replace",
+            )
+            text = (probe.stdout or "") + (probe.stderr or "")
+            found = engine_mod.engine_from_help(text)
+            if found is not None and found.id == self.engine.id:
+                return True, ""
+            if found is not None:
+                return False, t("该二进制属于 {engine} 引擎",
+                                engine=found.display_name)
+            return False, t("无法识别的服务器（--help 未匹配任何已知引擎）")
+        except FileNotFoundError:
+            return False, "not found"
+        except Exception as e:
+            return False, str(e)
+
     def _set_server_path(self):
-        # E1: dialog to view/set the llama-server executable path.
+        # E1: dialog to view/set the server executable of *this* engine.
         # Prefilled with the currently effective path (explicit setting first,
         # then the PATH-resolved one); empty only when nothing was found.
-        resolved = get_server_path()
-        explicit = load_server_path()
+        engine = self.engine
+        is_llama = engine.id == LLAMA_ENGINE_ID
+        resolved = self._server_binary()
+        explicit = load_server_path(engine.id)
         # Prefill a dead explicit setting would just re-verify the same miss —
         # fall back to the currently resolved path in that case.
         prefill = explicit if (explicit and Path(explicit).is_file()) else \
-            (resolved if resolved != "llama-server" else "")
+            (resolved if resolved and resolved != engine.bare_name() else "")
         # Themed frameless card dialog (custom header + shadow + accent OK) —
         # the old plain native dialog had a clashing OS title bar on Windows.
         from ui.server_path_dialog import ServerPathDialog
-        dialog = ServerPathDialog(self, prefill, resolved, self.theme)
+        dialog = ServerPathDialog(self, prefill, resolved, self.theme,
+                                  engine=engine)
         result = dialog.exec()
         dialog.deleteLater()  # don't leave a hidden top-level behind
         if result != QDialog.DialogCode.Accepted:
@@ -2151,26 +2397,24 @@ class MainWindow(QMainWindow):
         path = str(Path(dialog.path()).expanduser())
         if not path:
             return
-        # Validate before saving: the binary must answer --version
-        verified, detail = False, ""
-        try:
-            result = subprocess.run(
-                [path, "--version"],
-                capture_output=True, text=True, timeout=10,
-                encoding="utf-8", errors="replace",
-            )
-            verified = result.returncode == 0 and bool((result.stdout + result.stderr).strip())
-        except FileNotFoundError:
-            detail = "not found"
-        except Exception as e:
-            detail = str(e)
+        # Validate before saving: llama.cpp must answer --version, a second
+        # engine must at least produce a matching --help.
+        verified, detail = self._verify_server_binary(path)
         if not verified:
             self.statusBar().showMessage(t("路径验证失败: {e}", e=detail or path), 8000)
-            if ThemedMessageBox.question(self, t("llama-server 路径"),
-                                    t("路径验证失败，仍要保存吗？")) != QMessageBox.StandardButton.Yes:
+            ask = (t("路径验证失败，仍要保存吗？") if is_llama
+                   else t("路径验证失败（{detail}），仍要保存吗？", detail=detail or path))
+            title = (t("llama-server 路径") if is_llama
+                     else t("{engine} 路径", engine=engine.display_name))
+            if ThemedMessageBox.question(self, title, ask,
+                                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                                    ) != QMessageBox.StandardButton.Yes:
                 return
-        save_server_path(path)
-        self.statusBar().showMessage(t("llama-server 路径已设置: {path}", path=path), 8000)
+        save_server_path(path, engine.id)
+        self.statusBar().showMessage(
+            t("llama-server 路径已设置: {path}", path=path) if is_llama else
+            t("{engine} 路径已设置: {path}", engine=engine.display_name, path=path),
+            8000)
         # Refresh version label + live defaults against the new binary (A10 flow)
         old_worker = getattr(self, '_startup_worker', None)
         if old_worker is not None and old_worker.isRunning():
@@ -2186,8 +2430,10 @@ class MainWindow(QMainWindow):
     def _restore_ui_state(self):
         # E2: restore window geometry, mode, tab positions, splitter ratio.
         # Each value is validated individually — a partial/corrupt prefs dict
-        # degrades silently to the built-in defaults.
-        prefs = load_ui_prefs()
+        # degrades silently to the built-in defaults. Read through this
+        # engine's view (load_ui_prefs): mode / tabs / quick toggles are
+        # per-engine, geometry and splitter are shared.
+        prefs = load_ui_prefs(self.engine_id)
         if not prefs:
             return
         import base64
@@ -2232,7 +2478,7 @@ class MainWindow(QMainWindow):
             except (TypeError, ValueError):
                 pass
         if isinstance(prefs.get("mode"), int) and not isinstance(prefs.get("mode"), bool) \
-                and prefs["mode"] in (0, 1):
+                and prefs["mode"] in (0, 1) and self.engine.has_basic_mode:
             self.mode_combo.setCurrentIndex(prefs["mode"])
         # adv_tab_key (stable tab key) wins over adv_tab (index) — the tab
         # order changed with the 9-tab semantic regrouping, so a saved index
@@ -2267,7 +2513,7 @@ class MainWindow(QMainWindow):
         if result == QDialog.DialogCode.Accepted:
             keys = list(dlg.result_keys())
             self.basic_panel.set_quick_params(keys)
-            save_ui_pref("quick_params", keys)  # persist immediately (E10)
+            save_ui_pref("quick_params", keys, self.engine_id)  # immediate (E10)
             self._sync_panel_min()  # E11: more keys can grow the panel's min height
             QTimer.singleShot(0, self._sync_panel_min)  # ...and once more on the settled layout
             self._apply_params_to_current()
@@ -2281,7 +2527,7 @@ class MainWindow(QMainWindow):
         # window size, so the previously saved value (or nothing → the E14
         # screen-relative default on next launch) is kept.
         if self.isMaximized():
-            prev = load_ui_prefs().get("geometry")
+            prev = load_ui_prefs(self.engine_id).get("geometry")
             geo = prev if (isinstance(prev, (list, tuple))
                            and len(prev) == 4) else None
         else:
@@ -2294,9 +2540,18 @@ class MainWindow(QMainWindow):
             "adv_tab_key": self.advanced_panel.current_tab_key(),
             "bottom_tab": self.tab_widget.currentIndex(),
             "quick_params": self.basic_panel.get_quick_params(),
-        })
+        }, self.engine_id)
 
     def closeEvent(self, event):
+        # Bookkeeping first: _switch_engine hands the replacement window to
+        # _pending_engine_windows so Python cannot collect it mid-switch. Each
+        # window takes itself back out when it closes, otherwise a session that
+        # switched engines a few times would keep every window it passed
+        # through alive (and each new one would lengthen the list).
+        try:
+            _pending_engine_windows.remove(self)
+        except ValueError:
+            pass
         # Step-by-step trace: if a "closing" app hangs, the log shows
         # exactly which step it is in (or that it never got here).
         log = logging.getLogger("shutdown")
@@ -2329,6 +2584,13 @@ class MainWindow(QMainWindow):
             log.info("closeEvent: startup worker stopped")
         self._close_run_log()
         self._save_ui_state()
+        if self._switching_engine:
+            # Engine switch: this window is gone but the app is not — the
+            # replacement window is already shown, and quitting the event loop
+            # here would take it (and the session) down with it.
+            log.info("closeEvent: engine switch, keeping the event loop alive")
+            event.accept()
+            return
         log.info("closeEvent: done, accepting + explicit quit")
         # Single-window app: end the event loop deterministically instead
         # of relying on quitOnLastWindowClosed (its visible-window
@@ -2353,7 +2615,9 @@ class MainWindow(QMainWindow):
         self.file_menu.addAction(self._scan_path_action)
 
         # E1: explicit llama-server path (takes priority over PATH)
-        self._server_path_action = QAction(self._create_text_icon("S", QColor("#2980b9")), t("设置 llama-server 路径..."), self)
+        self._server_path_action = QAction(
+            self._create_text_icon("S", QColor("#2980b9")),
+            self._server_path_menu_text(), self)
         self._server_path_action.triggered.connect(self._set_server_path)
         self.file_menu.addAction(self._server_path_action)
 
@@ -2375,6 +2639,23 @@ class MainWindow(QMainWindow):
         self._quick_params_action = QAction(self._create_text_icon("Q", QColor("#f1c40f")), t("自定义快捷开关…"), self)
         self._quick_params_action.triggered.connect(self._customize_quick_toggles)
         self.settings_menu.addAction(self._quick_params_action)
+        self.settings_menu.addSeparator()
+
+        # Engines: which server binary this window drives. An exclusive action
+        # group rather than a dropdown — the current engine has to be visible
+        # at a glance, and picking the one already active must be a no-op.
+        self._engine_group = QActionGroup(self)
+        self._engine_group.setExclusive(True)
+        self._engine_actions = {}
+        for eng in engine_mod.ENGINES.values():
+            act = QAction(t("引擎: {name}", name=eng.display_name), self)
+            act.setCheckable(True)
+            act.setChecked(eng.id == self.engine_id)
+            act.setToolTip(t("切换服务器引擎（参数表、预设与服务器路径都会随之改变）"))
+            act.triggered.connect(lambda _=False, eid=eng.id: self._switch_engine(eid))
+            self._engine_group.addAction(act)
+            self.settings_menu.addAction(act)
+            self._engine_actions[eng.id] = act
         self.settings_menu.addSeparator()
 
         self._lang_group = QActionGroup(self)
@@ -2448,6 +2729,78 @@ class MainWindow(QMainWindow):
         self._update_cmd_preview()
         self.statusBar().showMessage(t("已重置为默认值"), 2000)
 
+    def _switch_engine(self, engine_id, confirm=True):
+        """Rebuild the window around another engine (设置 → 引擎).
+
+        A fresh MainWindow rather than an in-place swap of the parameter
+        table: the schema decides which widgets the advanced panel builds,
+        which quick toggles the basic panel offers, what the preset baseline
+        is, and which startup probes are legal — all of that is constructor
+        work, and re-shelling a live window would leave the previous engine's
+        widgets wired to the new one.
+
+        Returns True when the switch happened (the old window is closed).
+        """
+        target = engine_mod.ENGINES.get(engine_id)
+        if target is None or engine_id == self.engine_id:
+            return False
+        if confirm:
+            reply = ThemedMessageBox.question(
+                self, t("切换引擎"),
+                t("切换到 {engine}？\n\n参数表、服务器路径与预设都会随之改变；"
+                  "正在运行的服务会被停止。", engine=target.display_name),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if reply != QMessageBox.StandardButton.Yes:
+                # The QActionGroup already moved the check mark; put it back.
+                act = self._engine_actions.get(self.engine_id)
+                if act is not None:
+                    act.blockSignals(True)
+                    act.setChecked(True)
+                    act.blockSignals(False)
+                return False
+        save_preferred_engine_id(engine_id)
+        if self.runner.is_running:
+            self.runner.stop(blocking=True)
+        # Persist THIS engine's UI state (suffixed keys) before teardown, so
+        # coming back finds the tabs/mode it had.
+        self._save_ui_state()
+        # The replacement must carry the *target* engine and its baseline: the
+        # constructor reads the schema/defaults off the engine, so leaving them
+        # out would hand back a llama.cpp window and silently undo the switch.
+        win = MainWindow(work_dir=str(self.work_dir), theme=self.theme,
+                         defaults=dict(target.fallback_defaults()),
+                         engine=target)
+        # The reference outlives this method: without the list Python would
+        # collect the new window the moment the switch finished. Each window
+        # drops itself out of the list when it is closed (see closeEvent), so
+        # switching back and forth does not pile windows up.
+        _pending_engine_windows.append(win)
+        win.show()
+        self._switching_engine = True
+        self.close()
+        return True
+
+    def _about_engine_lines(self) -> str:
+        """About-box engine block: the identity file's contents for an engine
+        with no `--version`, including *why* a feature group is absent when the
+        build compiled it out. Display only, exactly like core.kvmem_identity.
+        """
+        if self.engine.id == LLAMA_ENGINE_ID:
+            return ""
+        lines = [t("引擎: {engine}（{n} 个参数）", engine=self.engine.display_name,
+                   n=len(self._schema.PARAMS_BY_KEY))]
+        try:
+            identity = self.engine.identity(self._server_binary())
+        except Exception:
+            identity = None
+        if identity:
+            lines.extend(kvmem_identity.detail_lines(identity))
+            if identity.get("nvme_supported") is False:
+                lines.append(t("此构建已编译关闭 NVMe 卸载，因此没有 NVMe 相关参数"))
+        else:
+            lines.append(t("安装目录中没有 BUILD-INFO.json，版本无法读取"))
+        return "".join(f"　{line}<br>" for line in lines)
+
     def _show_about(self):
         msg = ThemedMessageBox(self)
         msg.setWindowTitle(t("关于"))
@@ -2460,18 +2813,26 @@ class MainWindow(QMainWindow):
         except Exception:
             pyqt_ver = PYQT_VERSION_STR
         try:
-            server_path = get_server_path()
+            server_path = self._server_for_display()
         except Exception:
-            server_path = "llama-server"
+            server_path = self.engine.bare_name()
+        is_llama = self.engine.id == LLAMA_ENGINE_ID
+        binary_line = (t("llama-server: {path}", path=server_path) if is_llama
+                       else t("{engine}: {path}", engine=self.engine.display_name,
+                              path=server_path))
         version_info = (
             t("版本: {v}", v=f"v{APP_VERSION}") + "<br>"
             + t("Python {p} · PyQt6 {q}",
                 p=platform.python_version(), q=pyqt_ver) + "<br>"
-            + t("llama-server: {path}", path=server_path) + "<br>"
+            + binary_line + "<br>"
         )
         if getattr(self, "_server_version_line", ""):
-            version_info += t("当前 llama-server: {line}",
-                              line=self._server_version_line) + "<br>"
+            version_info += (
+                t("当前 llama-server: {line}", line=self._server_version_line)
+                if is_llama else
+                t("当前 {engine}: {line}", engine=self.engine.display_name,
+                  line=self._server_version_line)) + "<br>"
+        version_info += self._about_engine_lines()
         version_info += "<br>"
         msg.setText(
             f"<b>🦙 llama.cpp Launcher v{APP_VERSION}</b><br><br>"
@@ -2767,7 +3128,7 @@ class MainWindow(QMainWindow):
         dlg.deleteLater()  # don't leave a hidden top-level behind
 
     def _check_server_info(self):
-        self._startup_worker = _StartupInfoWorker()
+        self._startup_worker = _StartupInfoWorker(engine=self.engine)
         self._startup_worker.version_ready.connect(self._on_version_result)
         self._startup_worker.version_failed.connect(self._on_version_failed)
         self._startup_worker.defaults_ready.connect(self._on_startup_defaults)
@@ -2812,7 +3173,11 @@ class MainWindow(QMainWindow):
         self.basic_panel.set_defaults(defaults)
         self.advanced_panel.set_defaults(defaults)
         self.advanced_panel.set_chat_templates(chat_templates)
-        refresh_defaults(defaults)
+        # The module-level DEFAULT_PRESET is the llama.cpp preset baseline
+        # (ConfigManager's fallback argument). A second engine must not rewrite
+        # it — its own managers are always constructed with explicit defaults.
+        if self.engine.id == LLAMA_ENGINE_ID:
+            refresh_defaults(defaults)
         for key, value in defaults.items():
             # A preset restored at startup explicitly set these keys — keep
             # the user's values even when they equal the fallback default.
@@ -2840,8 +3205,17 @@ class MainWindow(QMainWindow):
             text = f"🔖 llama.cpp v{ver_num} ({commit})"
             tooltip = t("llama.cpp 版本: {ver}\n提交: {commit}", ver=ver_num, commit=commit)
         else:
-            text = f"🔖 {version_line}"
-            tooltip = t("llama.cpp 版本信息") + f"\n{version_line}"
+            # Either a llama.cpp build whose --version line did not parse, or
+            # an engine with no --version at all (kvmem), where the worker
+            # sends the identity file's "v0.16.0-rc2 (4837d45be)" instead —
+            # hence the engine name in front of it.
+            prefix = ("" if self.engine.id == LLAMA_ENGINE_ID
+                      else f"{self.engine.display_name} ")
+            text = f"🔖 {prefix}{version_line}"
+            tooltip = (t("llama.cpp 版本信息")
+                       if self.engine.id == LLAMA_ENGINE_ID
+                       else t("{engine} 版本信息", engine=self.engine.display_name))
+            tooltip += f"\n{version_line}"
         self.version_label.setText(text)
         self.version_label.setStyleSheet("color: #16a34a; font-size: 12px; font-weight: bold;")
         # Store the base separately: _validate_params() may run again once the
@@ -2856,13 +3230,46 @@ class MainWindow(QMainWindow):
             self.version_label.setText(t("⚠️ 未找到 llama-server"))
             self.version_label.setStyleSheet("color: #dc2626; font-size: 12px; font-weight: bold;")
             self.version_label.setToolTip(t("无法找到 llama-server，请确保已添加到系统 PATH 环境变量"))
-        else:
-            self.version_label.setText(t("⚠️ 检测失败"))
-            self.version_label.setStyleSheet("color: #d97706; font-size: 12px;")
-            self.version_label.setToolTip(t("检测 llama-server 版本时出错"))
+            if self.engine.id != LLAMA_ENGINE_ID:
+                # "add it to PATH" is wrong advice here: this engine is only
+                # ever run from an explicit path (Engine.server_path).
+                self.version_label.setText(
+                    t("⚠️ 未找到 {engine}", engine=self.engine.display_name))
+                self.version_label.setToolTip(
+                    t("尚未配置 {engine} 的可执行文件路径，请在「文件 → 设置服务器路径…」中指定。",
+                      engine=self.engine.display_name))
+            return
+        if error_type == "no_identity":
+            # kvmem build with no BUILD-INFO.json (a hand-built tree): the
+            # binary is there and launchable, it just cannot say its version.
+            self._version_checked = True
+            self._version_base_tooltip = t(
+                "{engine} 版本未知（安装目录中没有 BUILD-INFO.json）",
+                engine=self.engine.display_name)
+            self.version_label.setText(
+                f"🔖 {self.engine.display_name} · " + t("版本未知"))
+            self.version_label.setStyleSheet("color: #d97706; font-size: 12px; font-weight: bold;")
+            self.version_label.setToolTip(self._version_base_tooltip)
+            self._validate_params()
+            return
+        self.version_label.setText(t("⚠️ 检测失败"))
+        self.version_label.setStyleSheet("color: #d97706; font-size: 12px;")
+        self.version_label.setToolTip(t("检测 llama-server 版本时出错"))
 
     def _validate_params(self):
-        from core.defaults import _FALLBACK_DEFAULTS, USER_INPUT_PARAMS
+        """Version-drift report for *this* engine: its --help baseline vs the
+        schema's own compiled-in defaults.
+
+        Three per-engine inputs, all read from the Engine so the llama.cpp path
+        is the same set of keys it always was:
+          * fallbacks  — the compiled-in baseline the binary is compared against
+          * user-input keys — paths/free text, a "default" for them is not drift
+          * NO_DRIFT_KEYS — values this engine refuses to adopt from --help even
+            when it starts printing them (kvmem sampling + port; empty for
+            llama.cpp, which is why that engine's report is unchanged)
+        """
+        fallbacks = self.engine.fallback_defaults()
+        skip = set(self.engine.user_input_keys()) | set(self.engine.no_drift_keys())
         missing, changed = [], []
         try:
             # Reuse the defaults parsed at startup (self.defaults) instead of spawning a
@@ -2871,8 +3278,8 @@ class MainWindow(QMainWindow):
             # USER_INPUT_PARAMS constant in core.defaults (per-user paths/keys/free
             # text and machine-specific settings) rather than an inline 67-key tuple.
             current_defaults = self.defaults
-            for key, fallback_val in _FALLBACK_DEFAULTS.items():
-                if key in USER_INPUT_PARAMS:
+            for key, fallback_val in fallbacks.items():
+                if key in skip:
                     continue
                 if key not in current_defaults:
                     missing.append(key)
@@ -2923,8 +3330,14 @@ class MainWindow(QMainWindow):
         box = ThemedMessageBox(self)
         box.setWindowTitle(t("参数版本差异"))
         box.setIcon(QMessageBox.Icon.Warning)
-        box.setText(t("检测到 {n} 项参数与当前 llama-server 版本不匹配",
-                     n=len(self._drift_missing) + len(self._drift_changed)))
+        if self.engine.id == LLAMA_ENGINE_ID:
+            head = t("检测到 {n} 项参数与当前 llama-server 版本不匹配",
+                     n=len(self._drift_missing) + len(self._drift_changed))
+        else:
+            head = t("检测到 {n} 项参数与当前 {engine} 版本不匹配",
+                     n=len(self._drift_missing) + len(self._drift_changed),
+                     engine=self.engine.display_name)
+        box.setText(head)
         box.setDetailedText("\n".join(lines))
         box.exec()
         box.deleteLater()  # don't leave a hidden top-level behind
@@ -3002,7 +3415,7 @@ class MainWindow(QMainWindow):
         # Menus
         self.file_menu.setTitle(t("文件"))
         self._scan_path_action.setText(t("设置扫描路径..."))
-        self._server_path_action.setText(t("设置 llama-server 路径..."))
+        self._server_path_action.setText(self._server_path_menu_text())
         self._refresh_action.setText(t("刷新模型列表"))
         self._exit_action.setText(t("退出"))
         self.settings_menu.setTitle(t("设置"))

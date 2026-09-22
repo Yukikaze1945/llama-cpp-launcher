@@ -35,7 +35,7 @@ def _apply_app_icon(app: QApplication):
     if os.path.exists(icon_path):
         app.setWindowIcon(QIcon(icon_path))
 from ui.main_window import MainWindow
-from core.defaults import _FALLBACK_DEFAULTS
+from core.engine import resolve_startup_engine
 from core.config import CONFIG_DIR, load_language
 from core.i18n import set_language
 
@@ -133,9 +133,20 @@ def main():
     # The window is shown immediately with fallback defaults; the live
     # llama-server --help / --version results are fetched on a background
     # thread and merged in asynchronously (plan A10).
+    #
+    # Which server binary this session drives is decided once, here: the
+    # settings preference if the user picked one in 设置 → 引擎, otherwise the
+    # configured paths (a settings.json whose server_path already points at
+    # llama-kvmem-server.exe gets the kvmem parameter table — anything else
+    # would send llama flags to a binary that exits 1 on them). The defaults
+    # passed in must be that engine's own baseline: they are what
+    # is_default()/preset diffs compare against, and "the value this server
+    # would use anyway" differs per engine.
+    engine = resolve_startup_engine()
     window = MainWindow(
         work_dir=_get_work_dir(),
-        defaults=dict(_FALLBACK_DEFAULTS),
+        defaults=dict(engine.fallback_defaults()),
+        engine=engine,
     )
     window.show()
     rc = app.exec()

@@ -7,6 +7,7 @@ from pathlib import Path
 from datetime import datetime
 
 from core.defaults import _FALLBACK_DEFAULTS
+from core import params_schema
 from core.i18n import t
 
 logger = logging.getLogger(__name__)
@@ -40,6 +41,13 @@ def _ensure_dirs():
         _dirs_initialized = True
 
 DEFAULT_PRESET = dict(_FALLBACK_DEFAULTS)
+
+#: Engine id of the original llama.cpp engine. Defined here, not in
+#: core.engine, because config keys are named after it (`last_preset#kvmem`)
+#: and importing the registry would be circular — core.engine reads settings.
+#: Anything else in an `engine` / preset / suffixed key is the *other* engine's
+#: id, and an unknown one resolves back to llama.cpp (see get_engine_by_id).
+LLAMA_ENGINE_ID = "llama"
 
 # A9: preset keys renamed or removed across llama-server versions. Both the
 # params-dict migration (load_preset) and the key-set migration
@@ -108,26 +116,83 @@ def load_language() -> str:
     return _load_settings().get("language", "zh")
 
 
-def save_ui_prefs(prefs: dict):
-    """E2: persist window geometry/mode/tabs/splitter ratio (small JSON-safe dict)."""
+#: UI keys that are per-engine (a kvmem advanced tab index is meaningless for
+#: llama.cpp and vice versa). Everything else in `ui` — geometry, splitter,
+#: theme, language — is genuinely shared between engines.
+#:
+#: an adv_tab index and the tab key that replaces it (main_window._restore_ui_state)
+#: are both engine-specific: kvmem has 6 tabs, llama.cpp 9.
+UI_PREF_ENGINE_KEYS = ("mode", "adv_tab", "adv_tab_key", "bottom_tab",
+                       "quick_params")
+
+
+def _suffix_engine_keys(prefs: dict, engine_id: str) -> dict:
+    """Suffix only what is genuinely per-engine; shared keys stay shared.
+
+    `load_ui_prefs`/`_merge_engine_keys` override just UI_PREF_ENGINE_KEYS, so
+    suffixing everything would write a `geometry#kvmem` that nothing reads back
+    and a kvmem window would silently keep restoring the other engine's size.
+    """
+    return {_engine_key(k, engine_id) if k in UI_PREF_ENGINE_KEYS else k: v
+            for k, v in prefs.items()}
+
+
+def _merge_engine_keys(ui: dict, engine_id: str) -> dict:
+    """Read view of the `ui` dict for one engine.
+
+    llama.cpp reads the unsuffixed keys (byte-identical to before); another
+    engine reads only shared keys plus its own suffixed ones, so switching
+    engines cannot carry a tab index or a quick-toggle list across.
+    """
+    if not engine_id or engine_id == LLAMA_ENGINE_ID:
+        return {k: v for k, v in ui.items() if "#" not in k}
+    out = {k: v for k, v in ui.items() if "#" not in k}
+    suffix = f"#{engine_id}"
+    for key in UI_PREF_ENGINE_KEYS:
+        if key + suffix in ui:
+            out[key] = ui[key + suffix]
+    return out
+
+
+def _owned_by_engine(ui: dict, engine_id: str) -> set:
+    """Keys of the stored `ui` dict that belong to one engine's view."""
+    if not engine_id or engine_id == LLAMA_ENGINE_ID:
+        return {k for k in ui if "#" not in k}
+    suffix = f"#{engine_id}"
+    return {k for k in ui if k.endswith(suffix)}
+
+
+def save_ui_prefs(prefs: dict, engine_id: str = LLAMA_ENGINE_ID):
+    """E2: persist window geometry/mode/tabs/splitter ratio (small JSON-safe dict).
+
+    Replaces *this engine's* view only: another engine's suffixed keys (and the
+    llama.cpp unsuffixed ones) survive, which is what keeps the two engines' UI
+    state from overwriting each other.
+    """
     settings = _load_settings()
-    settings["ui"] = prefs
+    stored = settings.get("ui")
+    stored = dict(stored) if isinstance(stored, dict) else {}
+    for key in _owned_by_engine(stored, engine_id):
+        stored.pop(key, None)
+    stored.update(_suffix_engine_keys(prefs, engine_id))
+    settings["ui"] = stored
     _save_settings(settings)
 
 
-def load_ui_prefs() -> dict:
+def load_ui_prefs(engine_id: str = LLAMA_ENGINE_ID) -> dict:
     prefs = _load_settings().get("ui")
-    return prefs if isinstance(prefs, dict) else {}
+    prefs = prefs if isinstance(prefs, dict) else {}
+    return _merge_engine_keys(prefs, engine_id)
 
 
-def save_ui_pref(key: str, value):
+def save_ui_pref(key: str, value, engine_id: str = LLAMA_ENGINE_ID):
     """E10: update a single 'ui' prefs entry without rewriting the rest
     (e.g. quick_params changes are persisted immediately, not on close)."""
     settings = _load_settings()
     prefs = settings.get("ui")
     if not isinstance(prefs, dict):
         prefs = {}
-    prefs[key] = value
+    prefs[_engine_key(key, engine_id)] = value
     settings["ui"] = prefs
     _save_settings(settings)
 
@@ -148,34 +213,90 @@ def save_theme(theme: str):
 # Resolution order: explicit path in settings.json (if the file still exists)
 # > shutil.which("llama-server") (i.e. PATH, the previous behavior) > bare
 # "llama-server" (last resort, so errors surface the same way as before).
+#
+# Second engine: settings stays *additive*. `server_path` keeps its exact
+# meaning for the llama.cpp engine (so an install written by the official
+# launcher reads identically and the reverse upgrade never loses a path), and
+# every other engine lives in server_paths[<id>]. The same rule covers the two
+# engine-dependent UI values: llama.cpp writes the original unsuffixed keys,
+# other engines write <key>#<engine-id>.
 _server_path_cache = None
+_SERVER_PATHS_KEY = "server_paths"
+_PREFERRED_ENGINE_KEY = "engine"
 
 
-def load_server_path() -> str:
-    return _load_settings().get("server_path", "") or ""
+def _engine_key(key: str, engine_id: str) -> str:
+    """llama.cpp keeps the historical unsuffixed key; others get `key#engine`."""
+    if not engine_id or engine_id == LLAMA_ENGINE_ID:
+        return key
+    return f"{key}#{engine_id}"
+
+
+def load_preferred_engine_id() -> str:
+    """Which engine this install drives ("" = not chosen -> detect it).
+
+    No validation here: core.engine.get_engine_by_id() maps anything unknown
+    back to llama.cpp, which is exactly the pre-kvmem behaviour, and importing
+    the registry from config would be circular.
+    """
+    value = _load_settings().get(_PREFERRED_ENGINE_KEY)
+    return value if isinstance(value, str) else ""
+
+
+def save_preferred_engine_id(engine_id: str):
+    settings = _load_settings()
+    if engine_id and engine_id != LLAMA_ENGINE_ID:
+        settings[_PREFERRED_ENGINE_KEY] = engine_id
+    else:
+        settings.pop(_PREFERRED_ENGINE_KEY, None)  # absent = llama.cpp
+    _save_settings(settings)
+
+
+def load_server_path(engine_id: str = LLAMA_ENGINE_ID) -> str:
+    """The configured path for one engine, exactly as stored (no existence check)."""
+    settings = _load_settings()
+    if not engine_id or engine_id == LLAMA_ENGINE_ID:
+        return settings.get("server_path", "") or ""
+    paths = settings.get(_SERVER_PATHS_KEY)
+    if not isinstance(paths, dict):
+        return ""
+    value = paths.get(engine_id)
+    return value if isinstance(value, str) else ""
+
+
+# Public alias used by core.engine (reads better at that call site).
+get_configured_server_path = load_server_path
+
+
+def save_server_path(path: str, engine_id: str = LLAMA_ENGINE_ID):
+    global _server_path_cache
+    settings = _load_settings()
+    if not engine_id or engine_id == LLAMA_ENGINE_ID:
+        settings["server_path"] = path
+    else:
+        paths = settings.get(_SERVER_PATHS_KEY)
+        paths = dict(paths) if isinstance(paths, dict) else {}
+        paths[engine_id] = path
+        settings[_SERVER_PATHS_KEY] = paths
+    _save_settings(settings)
+    _server_path_cache = None  # invalidate so every caller sees the new path
 
 
 # Last-used preset: the launcher restores on startup the preset the user
 # last clicked 加载 for. The name lives in settings.json ("" = never loaded,
-# i.e. startup keeps the defaults — nothing to restore).
+# i.e. startup keeps the defaults — nothing to restore). Suffixed per engine
+# (see _engine_key) so switching engines cannot restore a preset belonging to
+# the other parameter table.
 
-def load_last_preset() -> str:
-    name = _load_settings().get("last_preset", "")
+def load_last_preset(engine_id: str = LLAMA_ENGINE_ID) -> str:
+    name = _load_settings().get(_engine_key("last_preset", engine_id), "")
     return name if isinstance(name, str) else ""
 
 
-def save_last_preset(name: str):
+def save_last_preset(name: str, engine_id: str = LLAMA_ENGINE_ID):
     settings = _load_settings()
-    settings["last_preset"] = name
+    settings[_engine_key("last_preset", engine_id)] = name
     _save_settings(settings)
-
-
-def save_server_path(path: str):
-    global _server_path_cache
-    settings = _load_settings()
-    settings["server_path"] = path
-    _save_settings(settings)
-    _server_path_cache = None  # invalidate so every caller sees the new path
 
 
 def get_server_path() -> str:
@@ -209,15 +330,35 @@ class ConfigManager:
     Deliberately stateless about parameter values: MainWindow.params is the
     single source of truth. Presets are passed in / returned as plain dicts;
     the only state kept here is the defaults baseline (used to store just the
-    diff on save and to merge against on load).
+    diff on save and to merge against on load) and the engine this manager
+    belongs to.
+
+    Engine isolation, which is the reason the engine id lives here: the two
+    tables share ~8 key names whose values are *not* interchangeable
+    (ctx_size, batch_size, spec_type, chat_template*, temperature...). Loading
+    a llama.cpp preset into the kvmem engine would hand it `spec_type:
+    ngram-simple`, which kvmem answers `unsupported --spec-type` + exit 1 —
+    indistinguishable from a kvmem bug. So every preset carries its engine,
+    the list only shows the current one, and any key the current schema does
+    not define is dropped on the way in.
     """
 
-    def __init__(self, defaults=None, schema=None):
+    #: Preset file-format version per engine (A9). Existing v1 files carry no
+    #: `engine` field and are llama.cpp's — that inference is why the kvmem
+    #: engine writes 2, so a v2 file can never be mistaken for a legacy one.
+    PRESET_VERSION_BY_ENGINE = {LLAMA_ENGINE_ID: 1, "kvmem": 2}
+
+    def __init__(self, defaults=None, schema=None, engine_id: str = LLAMA_ENGINE_ID):
         self._defaults = defaults or dict(DEFAULT_PRESET)
         # Engine seam: an engine schema module may override the preset key
         # migration; core.config's own tables are the llama.cpp rules and
         # stay the default so every existing call site is unchanged.
-        self._schema = schema
+        self._schema = schema or params_schema
+        self._engine_id = engine_id or LLAMA_ENGINE_ID
+
+    @property
+    def engine_id(self):
+        return self._engine_id
 
     def _migrate(self, params):
         return getattr(self._schema, "migrate_preset_keys",
@@ -226,6 +367,39 @@ class ConfigManager:
     def _migrate_keys(self, keys):
         return getattr(self._schema, "migrate_preset_key_set",
                        migrate_preset_key_set)(keys)
+
+    def drop_foreign_keys(self, params: dict) -> dict:
+        """Keep only keys this engine's schema defines (see the class docstring)."""
+        known = getattr(self._schema, "PARAMS_BY_KEY", None)
+        if not known:
+            return params
+        return {k: v for k, v in params.items() if k in known}
+
+    def drop_foreign_key_set(self, keys) -> set:
+        """Set-flavoured :meth:`drop_foreign_keys`."""
+        known = getattr(self._schema, "PARAMS_BY_KEY", None)
+        if not known:
+            return set(keys)
+        return {k for k in keys if k in known}
+
+    @staticmethod
+    def preset_engine_id(data: dict) -> str:
+        """Engine a parsed preset file belongs to (legacy files: llama.cpp)."""
+        engine = data.get("engine")
+        if isinstance(engine, str) and engine:
+            return engine
+        return LLAMA_ENGINE_ID
+
+    def preset_matches_this_engine(self, path) -> bool:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, IOError, json.JSONDecodeError):
+            # Unreadable: only the default engine may claim it, so a broken
+            # file cannot silently load into the other engine's parameter set.
+            return self._engine_id == LLAMA_ENGINE_ID
+        return (isinstance(data, dict)
+                and self.preset_engine_id(data) == self._engine_id)
 
     @property
     def defaults(self):
@@ -252,7 +426,10 @@ class ConfigManager:
                 pass
         data = {
             "name": name,
-            "version": 1,  # A9: schema version for future preset migrations
+            "version": self.PRESET_VERSION_BY_ENGINE.get(self._engine_id, 1),
+            # A9: schema version for future preset migrations + the engine the
+            # diff was taken against (the baseline is per-engine).
+            "engine": self._engine_id,
             "created": created,
             "params": {k: v for k, v in params.items()
                        if v != self._defaults.get(k)},
@@ -276,13 +453,23 @@ class ConfigManager:
         except (OSError, IOError, json.JSONDecodeError) as e:
             logger.warning(t("加载预设失败: {e}", e=e))
             return False
+        if not isinstance(data, dict):
+            logger.warning(t("加载预设失败: params 字段不是字典"))
+            return False
+        if self.preset_engine_id(data) != self._engine_id:
+            # Reachable only for a hand-copied file (list_presets filters), and
+            # loading it is exactly the failure the engine tag exists to prevent.
+            logger.warning("preset %s belongs to engine %s, not %s — refused",
+                           name, self.preset_engine_id(data), self._engine_id)
+            return False
         params = data.get("params", {})
         if not isinstance(params, dict):
             logger.warning(t("加载预设失败: params 字段不是字典"))
             return False
-        params = dict(params)
-        # Migrate param keys renamed/removed across llama-server versions
-        self._migrate(params)
+        # Migration first: a renamed legacy key is by definition not in the
+        # schema yet, so filtering before renaming would silently discard the
+        # user's explicit value instead of carrying it to the new key.
+        params = self.drop_foreign_keys(self._migrate(dict(params)))
         # C3: return the merged params instead of mutating self.current —
         # MainWindow.params is the single source of truth
         merged = dict(self._defaults)
@@ -290,7 +477,8 @@ class ConfigManager:
         return merged
 
     def preset_stored_keys(self, name):
-        """Keys the preset explicitly stores (post-migration), or None.
+        """Keys the preset explicitly set (post-migration, foreign keys
+        dropped), or None.
 
         None when the preset is missing/unreadable. Used at startup so a
         restored preset's explicit values survive the live --help defaults
@@ -306,13 +494,15 @@ class ConfigManager:
                 data = json.load(f)
         except (OSError, IOError, json.JSONDecodeError):
             return None
-        params = data.get("params", {})
+        params = data.get("params", {}) if isinstance(data, dict) else {}
         if not isinstance(params, dict):
             return set()
-        keys = set(params.keys())
-        # Mirror load_preset()'s cross-version migration so the protected
-        # set matches the keys that actually end up in the merged params.
-        return self._migrate_keys(keys)
+        if self.preset_engine_id(data) != self._engine_id:
+            return set()
+        # Mirror load_preset()'s filtering + cross-version migration so the
+        # protected set matches the keys that actually end up in the merged
+        # params (migration before filtering, for the same reason).
+        return self.drop_foreign_key_set(self._migrate_keys(params))
 
     def delete_preset(self, name):
         name = _sanitize_preset_name(name)
@@ -326,6 +516,13 @@ class ConfigManager:
         return False
 
     def list_presets(self):
+        """Presets of *this* engine, sorted by name.
+
+        A preset written for the other engine is not merely inconvenient to
+        load, it is a parameter dict whose shared keys carry values the running
+        binary may reject outright — so it is not listed at all rather than
+        listed-and-refused.
+        """
         _ensure_dirs()
         presets = []
         for f in PRESETS_DIR.glob("*.json"):
@@ -336,10 +533,16 @@ class ConfigManager:
                 try:
                     with open(f, "r", encoding="utf-8") as fh:
                         data = json.load(fh)
+                    if not isinstance(data, dict) or \
+                            self.preset_engine_id(data) != self._engine_id:
+                        continue
                     if isinstance(data.get("created"), str) and data["created"]:
                         created = data["created"]
                 except (OSError, IOError, json.JSONDecodeError):
-                    pass
+                    # Unreadable: keep it visible only for the default engine,
+                    # whose legacy files it may be.
+                    if self._engine_id != LLAMA_ENGINE_ID:
+                        continue
             except (FileNotFoundError, OSError):
                 continue
             presets.append({
@@ -373,6 +576,13 @@ class ConfigManager:
                 return False
             dest_name = _sanitize_preset_name(Path(src_path).stem)
             dest = PRESETS_DIR / f"{dest_name}.json"
+            # Normalise the engine tag instead of guessing from the importing
+            # session: a legacy (no `engine` field) file is llama.cpp's, and an
+            # imported kvmem preset must not start claiming to be llama.cpp's
+            # just because it arrived through a llama.cpp window. It then shows
+            # up in the list only for its own engine — which is the whole point
+            # of the tag (see the class docstring).
+            data["engine"] = self.preset_engine_id(data)
             with open(dest, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
             return True

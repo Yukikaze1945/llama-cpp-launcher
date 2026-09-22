@@ -45,6 +45,10 @@ Hard rules encoded here:
 with the existing fields (wattr=None hidden emitters, `value` as a free
 value-kind label, min/max/items/skip_values/parser).
 """
+import json
+from pathlib import Path
+
+from .i18n import t
 from .params_schema import Param, P  # P is the same frozen dataclass
 
 ENGINE_ID = "kvmem"
@@ -532,3 +536,120 @@ NO_CONTROL_KEYS = {
     "--kvmem-raw-k-nvme": "需要 NVMe，exit 1",
     "--jinja": "no-op；合并成复选框会在取消勾选时发出被拒的 --no-jinja",
 }
+
+#: Cache types whose K forces V to be identical (measured: `--kv-dtype f32
+#: -ctk q8_0` -> "incompatible KV cache types", fatal; the reverse order
+#: passes, and a lone `-ctk q8_0` passes only because V falls back to
+#: --kv-dtype's own q8_0).
+QUANT_CACHE_TYPES = ("q8_0", "q5_0", "q4_0")
+
+#: thinking_mode combo indices (the order of its `items` above).
+THINKING_TEMPLATE_DEFAULT, THINKING_ON, THINKING_OFF = 0, 1, 2
+
+
+def _is_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def validate_params(values: dict) -> list:
+    """States this engine's argv parser would reject: [(param_key, reason)].
+
+    The rules are the *measured* failure paths of v0.16.0-rc2, plus the range
+    checks the binary skips entirely. It exists because a kvmem rejection
+    happens before anything readable is logged — the exit-1 line is the last
+    thing the launcher sees, so an unchecked value looks like a crash rather
+    than like a bad argument, and `-temperature -1.00` (the "do not send"
+    sentinel leaking into argv) is precisely that case.
+
+    Contract with the caller (MainWindow._engine_validation_problems): it only
+    runs this when the engine's schema module defines it, so llama.cpp keeps
+    starting with no pre-flight check at all. Nothing here rewrites values or
+    touches the CommandBuilder — a passing command line is emitted exactly as
+    the schema says.
+    """
+    problems: list = []
+
+    def bad(key: str, reason: str):
+        # Callers pass already-translated text: reasons are user-facing copy and
+        # English mode must not leak Chinese into the rejection dialog.
+        problems.append((key, reason))
+
+    def get(key, default=None):
+        return values.get(key, default)
+
+    # 1. ranges the parser itself does not enforce (measured: `--kvmem-gpu-ratio
+    #    2` and `-ngl auto` are accepted silently). A value equal to the schema
+    #    default is the "do not send" sentinel, so it is legal by definition.
+    for key, (lo, hi) in LEGAL_RANGE.items():
+        value = get(key)
+        if not _is_number(value) or value == PARAMS_BY_KEY[key].default:
+            continue
+        if lo is not None and value < lo:
+            if hi is not None:
+                bad(key, t("取值必须在 {lo} 到 {hi} 之间（当前 {v}）", lo=lo, hi=hi, v=value))
+            else:
+                bad(key, t("取值不得小于 {lo}（当前 {v}）", lo=lo, v=value))
+        elif hi is not None and value > hi:
+            bad(key, t("取值不得大于 {hi}（当前 {v}）", hi=hi, v=value))
+
+    # 2. list-valued flags. Combos already restrict the choices, but a preset
+    #    imported from the other engine shares key names (spec_type, chat_*)
+    #    whose values are not in this set — `unsupported --spec-type` is a
+    #    parse-time exit, so it is checked here as well.
+    for param in UI_PARAMS:
+        if not param.items or param.widget not in ("combo", "combo_edit"):
+            continue
+        value = get(param.key)
+        if value is None or value == "":
+            # "" is a real choice when it is one of the items (cache types:
+            # "follow --kv-dtype") or when the emit mode skips it
+            # (--reasoning-effort: empty = template default, nothing sent).
+            if "" in param.items or param.emit == "diff_nonempty":
+                continue
+            bad(param.key, t("不能留空，只能是 {items} 之一", items=" / ".join(param.items)))
+            continue
+        if value not in param.items:
+            bad(param.key, t("取值只能是 {items} 之一（当前 {v}）",
+                             items=" / ".join(param.items), v=value))
+
+    # 3. KV cache pairing (§5.3). Effective K = -ctk when set, else --kv-dtype;
+    #    same for V. A quantized K with any other V is fatal, so the pair is
+    #    checked rather than each side alone.
+    kv_dtype = get("kv_dtype") or ""
+    eff_k = get("cache_type_k") or kv_dtype
+    eff_v = get("cache_type_v") or kv_dtype
+    if eff_k in QUANT_CACHE_TYPES and eff_v != eff_k:
+        bad("cache_type_v", t("K 缓存为量化类型 {k} 时 V 必须与之相同（当前 {v}）",
+                              k=eff_k, v=eff_v or t("（空）")))
+
+    # 4. thinking tri-state (§5.4): --reasoning-effort none switches thinking
+    #    off by itself, so pairing it with "开启思考" is contradictory (and the
+    #    flags are independent, so nothing later resolves it).
+    if get("thinking_mode") == THINKING_ON and get("reasoning_effort") == "none":
+        bad("reasoning_effort", t("none 会关闭思考，与「开启思考」互斥"))
+    if get("enable_thinking") and get("no_think"):
+        bad("thinking_mode", t("不能同时发送 --enable-thinking 与 --no-think"))
+
+    # 5. chat template (§5.5): exclusive pair, and the kwargs flag must be a
+    #    JSON object (parse-time rejection, measured).
+    if get("chat_template") and get("chat_template_file"):
+        bad("chat_template", t("与模板文件互斥，只能填一个"))
+    kwargs_text = get("chat_template_kwargs") or ""
+    if kwargs_text.strip():
+        try:
+            parsed = json.loads(kwargs_text)
+        except (ValueError, TypeError):
+            parsed = None
+        if not isinstance(parsed, dict):
+            # No kwargs: t() leaves literal braces alone (C4).
+            bad("chat_template_kwargs", t("必须是 JSON object，例如 {\"key\": \"value\"}"))
+
+    # 6. template file must exist (the engine checks it at parse time); only an
+    #    absolute path is judged, since a relative one resolves against the
+    #    server's working directory, not ours.
+    template_file = get("chat_template_file") or ""
+    if template_file and Path(template_file).is_absolute() \
+            and not Path(template_file).is_file():
+        bad("chat_template_file", t("文件不存在"))
+
+    return problems

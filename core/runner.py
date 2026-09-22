@@ -47,9 +47,32 @@ class ServerRunner(QObject):
         self._max_log_buffer = 8000
         self._ready_tail = ""
         self._is_stopping = False
+        #: Program of the last/current start() — a second engine means the
+        #: user-facing wording cannot hard-code "llama-server".
+        self._server_cmd = ""
         self._kill_timer = QTimer(self)
         self._kill_timer.setSingleShot(True)
         self._kill_timer.timeout.connect(self._force_kill)
+
+    def _binary_label(self) -> str:
+        """File name (extension stripped) of the server we run.
+
+        The extension matters for the comparison the callers do: a Windows
+        path resolves to `llama-server.exe`, and the message must stay the
+        original one for that engine — so the label has to come back as
+        `llama-server`, not `llama-server.exe`.
+        """
+        name = str(self._server_cmd or "").replace("\\", "/").rstrip("/").split("/")[-1]
+        if name.lower().endswith(".exe"):
+            name = name[:-4]
+        return name or "llama-server"
+
+    def _unkillable_message(self) -> str:
+        """Same text for every engine, with the binary name swapped in."""
+        label = self._binary_label()
+        if label == "llama-server":
+            return t("llama-server 进程无法终止，可能需要手动结束。")
+        return t("{server_name} 进程无法终止，可能需要手动结束。", server_name=label)
 
     @property
     def is_running(self):
@@ -59,11 +82,15 @@ class ServerRunner(QObject):
     def is_ready(self):
         return self._is_ready
 
-    def start(self, args, work_dir=None):
+    def start(self, args, work_dir=None, server_path=None):
         if self._is_running or self._is_stopping:
             return
-        # E1: configured path > PATH > bare name (see core.config)
-        cmd = get_server_path()
+        # E1: configured path > PATH > bare name (see core.config). The
+        # caller passes `server_path` once there is more than one engine to
+        # configure: llama.cpp's resolution above is meaningless for a second
+        # binary. Default None keeps every existing call site's behaviour.
+        cmd = server_path or get_server_path()
+        self._server_cmd = cmd
         self.process.setProgram(cmd)
         self.process.setArguments(args)
         if work_dir:
@@ -77,9 +104,14 @@ class ServerRunner(QObject):
         self.process.start()
         if self.process.state() == QProcess.ProcessState.NotRunning:
             self._is_running = False
-            self.error_occurred.emit(
-                t("启动 llama-server 失败（{server_path}）。请检查路径是否正确，或确保它在系统 PATH 中。",
-                  server_path=cmd))
+            label = self._binary_label()
+            if label == "llama-server":
+                msg = t("启动 llama-server 失败（{server_path}）。请检查路径是否正确，或确保它在系统 PATH 中。",
+                        server_path=cmd)
+            else:
+                msg = t("启动 {server_name} 失败（{server_path}）。请检查该路径是否存在且可执行。",
+                        server_name=label, server_path=cmd)
+            self.error_occurred.emit(msg)
         else:
             self.state_changed.emit("starting")
 
@@ -102,12 +134,13 @@ class ServerRunner(QObject):
             self._kill_timer.start(5000)
 
     def _do_force_kill(self):
-        logger.info("Force killing llama-server process")
+        logger.info("Force killing %s process", self._binary_label())
         self.process.kill()
         if not self.process.waitForFinished(15000):
-            logger.warning("llama-server process did not terminate after force kill")
+            logger.warning("%s process did not terminate after force kill",
+                           self._binary_label())
             if self.process.state() != QProcess.ProcessState.NotRunning:
-                self.error_occurred.emit(t("llama-server 进程无法终止，可能需要手动结束。"))
+                self.error_occurred.emit(self._unkillable_message())
 
     def _force_kill(self):
         self._kill_timer.stop()
@@ -118,8 +151,9 @@ class ServerRunner(QObject):
 
     def _check_force_kill_result(self):
         if self.process.state() != QProcess.ProcessState.NotRunning:
-            logger.warning("llama-server process still running after force kill")
-            self.error_occurred.emit(t("llama-server 进程无法终止，可能需要手动结束。"))
+            logger.warning("%s process still running after force kill",
+                           self._binary_label())
+            self.error_occurred.emit(self._unkillable_message())
 
     def _check_ready(self, text):
         if not self._is_ready and not self._is_stopping:

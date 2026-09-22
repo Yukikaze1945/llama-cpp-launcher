@@ -17,6 +17,8 @@ build_kvmem/
 # Local dev sandbox: second-venv and the copied config dir (kvmem engine work)
 .venv/
 .cfg-sandbox/
+# Sandbox pytest runs against (settings.json without server_path/engine keys)
+.cfg-test/
 
 # Reference docs
 gguf.md

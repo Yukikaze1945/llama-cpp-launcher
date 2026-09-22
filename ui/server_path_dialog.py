@@ -26,19 +26,30 @@ from ui.frameless import FramelessDialog, app_icon
 
 
 class ServerPathDialog(FramelessDialog):
-    """Ask for the absolute path of llama-server. Empty = keep current.
+    """Ask for the absolute path of a server executable. Empty = keep current.
 
     ``prefill``  — text to start in the edit (usually the explicit path
                    from settings, or the currently resolved one)
-    ``resolved`` — what get_server_path() returned (shown in the hint
-                   row; a bare "llama-server" gets a warning hint)
+    ``resolved`` — what the engine's server_path() returned (shown in the
+                   hint row; a bare "llama-server" gets a warning hint)
+    ``engine``   — the engine whose binary is being set. Every bit of wording
+                   below is keyed on its binary name, so the llama.cpp dialog
+                   reads exactly as it always did and a second engine gets its
+                   own name, example path and file filter instead of being
+                   told to find a llama-server it does not use.
     """
 
     def __init__(self, parent, prefill: str, resolved: str,
-                 theme: str = "dark"):
+                 theme: str = "dark", engine=None):
+        self._engine = engine
+        name = getattr(engine, "bare_name", None)
+        self._name = name() if callable(name) else "llama-server"
+        example = (getattr(engine, "path_example", "")
+                   if engine is not None else "") \
+            or r"C:\llama.cpp\build\bin\llama-server.exe"
         super().__init__(
             parent,
-            title=t("llama-server 路径"),
+            title=t("{name} 路径", name=self._name),
             icon=app_icon(),
             resizable=False,
             size=(600, 0),
@@ -48,7 +59,8 @@ class ServerPathDialog(FramelessDialog):
         lay = self.content_layout
 
         desc = QLabel(t(
-            "输入 llama-server 可执行文件的完整路径；留空则保持当前设置不变。"))
+            "输入 {name} 可执行文件的完整路径；留空则保持当前设置不变。",
+            name=self._name))
         desc.setObjectName("serverPathDesc")
         desc.setWordWrap(True)
         lay.addWidget(desc)
@@ -57,7 +69,7 @@ class ServerPathDialog(FramelessDialog):
         row.setSpacing(8)
         self.edit = QLineEdit()
         self.edit.setObjectName("serverPathEdit")
-        self.edit.setPlaceholderText(t("例如: C:\\llama.cpp\\build\\bin\\llama-server.exe"))
+        self.edit.setPlaceholderText(t("例如: {path}", path=example))
         fixed_font = QFontDatabase.systemFont(
             QFontDatabase.SystemFont.FixedFont)
         fixed_font.setPixelSize(13)
@@ -94,12 +106,14 @@ class ServerPathDialog(FramelessDialog):
         return self.edit.text().strip()
 
     def _set_hint(self, resolved: str):
-        warn = resolved == "llama-server" or not os.path.isfile(resolved)
+        warn = resolved in ("", self._name) or not os.path.isfile(resolved)
         self.hint.setObjectName(
             "serverPathHintWarn" if warn else "serverPathHintOk")
         self.hint.setText(t("当前生效: {path}").format(path=resolved))
         if warn:
             self.edit.setPlaceholderText(
+                t("未找到 {name}，请手动选择", name=self._name)
+                if self._name != "llama-server" else
                 t("未在 PATH 中找到 llama-server，请手动选择"))
         # Re-polish so the objectName (colour) change takes effect.
         style = self.hint.style()
@@ -108,8 +122,8 @@ class ServerPathDialog(FramelessDialog):
 
     def _browse(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, t("选择 llama-server 可执行文件"), "",
-            "Executable (llama-server*) (*.exe llama-server);;All files (*)")
+            self, t("选择 {name} 可执行文件", name=self._name), "",
+            f"Executable ({self._name}*) (*.exe {self._name});;All files (*)")
         if path:
             self.edit.setText(path)
 
