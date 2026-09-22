@@ -14,8 +14,8 @@ from PyQt6.QtWidgets import (
     QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
+from core import params_schema
 from core.i18n import t
-from core.params_schema import PARAMS_BY_KEY, TAB_TITLES
 from ui.frameless import FramelessDialog, app_icon
 from ui.quick_params import (
     QUICK_DEFAULT_KEYS, kind_display_name, quick_label_text, quick_short_label,
@@ -26,7 +26,7 @@ from ui.quick_params import (
 class QuickParamsDialog(FramelessDialog):
     """Returns the ordered key list via result_keys() after accept()."""
 
-    def __init__(self, parent=None, current_keys=None):
+    def __init__(self, parent=None, current_keys=None, schema=None):
         # E12: frameless themed card; resizable (two wide panes benefit
         # from extra width), edge-resize via the shared resize frame.
         super().__init__(
@@ -37,7 +37,10 @@ class QuickParamsDialog(FramelessDialog):
             size=(760, 520),
             min_size=(660, 460),
         )
-        self._keys = sanitize_quick_keys(current_keys)
+        # Engine seam: an engine parameter module (core.params_schema by
+        # default, so the offered pool and 恢复默认 list are unchanged).
+        self._schema = schema or params_schema
+        self._keys = sanitize_quick_keys(current_keys, schema=self._schema)
         self._tree_items = {}    # key -> QTreeWidgetItem (right pane)
         self._top_items = {}     # tab_key -> QTreeWidgetItem (group header)
 
@@ -151,9 +154,9 @@ class QuickParamsDialog(FramelessDialog):
 
     def _populate_tree(self):
         by_tab = {}
-        for p in quick_eligible():
+        for p in quick_eligible(self._schema):
             by_tab.setdefault(p.tab, []).append(p)
-        for tab_key, tab_title in TAB_TITLES:
+        for tab_key, tab_title in self._schema.TAB_TITLES:
             top = QTreeWidgetItem([t(tab_title)])
             font = top.font(0)
             font.setBold(True)
@@ -184,7 +187,7 @@ class QuickParamsDialog(FramelessDialog):
         self._sel.blockSignals(True)
         self._sel.clear()
         for k in self._keys:
-            p = PARAMS_BY_KEY[k]
+            p = self._schema.PARAMS_BY_KEY[k]
             item = QListWidgetItem(quick_label_text(p))
             item.setData(Qt.ItemDataRole.UserRole, k)
             flag = p.flag if isinstance(p.flag, str) else ""
@@ -248,7 +251,8 @@ class QuickParamsDialog(FramelessDialog):
             self._sync_tree(key, False)
 
     def _reset_default(self):
-        self._keys = list(QUICK_DEFAULT_KEYS)
+        self._keys = list(getattr(self._schema, "QUICK_DEFAULT_KEYS",
+                                  QUICK_DEFAULT_KEYS))
         self._sel.blockSignals(True)
         self._tree.blockSignals(True)
         self._sync_sel()
@@ -273,12 +277,12 @@ class QuickParamsDialog(FramelessDialog):
 
     def _apply_filter(self, raw: str):
         text = raw.strip().lower()
-        for tab_key, tab_title in TAB_TITLES:
+        for tab_key, tab_title in self._schema.TAB_TITLES:
             top = self._top_items[tab_key]
             visible = 0
             for i in range(top.childCount()):
                 child = top.child(i)
-                p = PARAMS_BY_KEY[child.data(0, Qt.ItemDataRole.UserRole)]
+                p = self._schema.PARAMS_BY_KEY[child.data(0, Qt.ItemDataRole.UserRole)]
                 show = self._match(p, text)
                 child.setHidden(not show)
                 if show:

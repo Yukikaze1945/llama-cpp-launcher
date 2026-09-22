@@ -9,7 +9,7 @@ from PyQt6.QtGui import QColor, QPalette, QPainter, QFont, QFontMetrics
 from PyQt6.QtCore import Qt, pyqtSignal, QSize
 from core.i18n import t
 from core.constants import DEFAULT_HOST, DEFAULT_PORT, CONTEXT_SIZE_PRESETS
-from core.params_schema import PARAMS_BY_KEY
+from core import params_schema
 from ui.param_help import make_help_button
 from ui.quick_params import (
     QUICK_DEFAULT_KEYS, build_quick_widget, quick_label_text,
@@ -89,11 +89,15 @@ class BasicPanel(QWidget):
     #: from the other groups.
     quick_wrap_changed = pyqtSignal(int)
 
-    def __init__(self, defaults=None, parent=None):
+    def __init__(self, defaults=None, parent=None, schema=None):
         super().__init__(parent)
         self._defaults = defaults or {}
+        # Engine seam: an engine parameter module (core.params_schema by
+        # default, so the quick toggles and their key list are unchanged).
+        self._schema = schema or params_schema
         self._help_btns = []
-        self._quick_keys = list(QUICK_DEFAULT_KEYS)
+        self._quick_keys = list(getattr(self._schema, "QUICK_DEFAULT_KEYS",
+                                        QUICK_DEFAULT_KEYS))
         self._quick_items = []
         self._quick_boxes = []
         self._quick_help_btns = []
@@ -501,7 +505,7 @@ class BasicPanel(QWidget):
         self._quick_cols_used = 0
         self._quick_rows_used = 0
         for key in self._quick_keys:
-            p = PARAMS_BY_KEY[key]
+            p = self._schema.PARAMS_BY_KEY[key]
             box = QWidget()
             row = QHBoxLayout(box)
             row.setContentsMargins(0, 0, 0, 0)
@@ -555,7 +559,7 @@ class BasicPanel(QWidget):
     def set_quick_params(self, keys):
         """E10: apply a quick-toggle key list (validated; rebuilds the group).
         No-op when the cleaned list is unchanged."""
-        cleaned = sanitize_quick_keys(keys)
+        cleaned = sanitize_quick_keys(keys, schema=self._schema)
         if cleaned == self._quick_keys:
             return
         self._quick_keys = cleaned

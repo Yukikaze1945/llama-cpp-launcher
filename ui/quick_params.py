@@ -46,10 +46,14 @@ def _T(s: str) -> str:
     return t(s) if _CJK_RE.search(s) else s
 
 
-def quick_eligible():
-    """All schema params allowed in the quick-toggles group (schema order)."""
+def quick_eligible(schema=None):
+    """All schema params allowed in the quick-toggles group (schema order).
+
+    `schema` is an engine parameter module (core.params_schema by default)."""
+    params = PARAMS if schema is None else schema.PARAMS
+    owned = getattr(schema, "BASIC_OWNED_KEYS", BASIC_OWNED_KEYS)
     out = []
-    for p in PARAMS:
+    for p in params:
         kind = p.widget
         if kind in _QUICK_KINDS:
             ok = True
@@ -57,20 +61,22 @@ def quick_eligible():
             ok = p.items is not None  # static items only (skip chat_template)
         else:
             ok = False
-        if ok and p.key not in BASIC_OWNED_KEYS:
+        if ok and p.key not in owned:
             out.append(p)
     return out
 
 
-def quick_pool_keys():
-    return {p.key for p in quick_eligible()}
+def quick_pool_keys(schema=None):
+    return {p.key for p in quick_eligible(schema)}
 
 
-def sanitize_quick_keys(raw, default=QUICK_DEFAULT_KEYS):
+def sanitize_quick_keys(raw, default=None, schema=None):
     """Validate an ordered key list (e.g. from settings.json): drop unknown
     keys / non-strings / duplicates, keep order. Empty result -> default set.
     (llama.cpp version drift can invalidate stored keys.)"""
-    pool = quick_pool_keys()
+    if default is None:
+        default = getattr(schema, "QUICK_DEFAULT_KEYS", QUICK_DEFAULT_KEYS)
+    pool = quick_pool_keys(schema)
     seen, out = set(), []
     for k in (raw or []):
         if isinstance(k, str) and k in pool and k not in seen:

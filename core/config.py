@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import re
 import shutil
 from pathlib import Path
@@ -17,7 +18,12 @@ def _sanitize_preset_name(name: str) -> str:
     return result if result else "unnamed"
 
 
-CONFIG_DIR = Path.home() / ".llama-cpp-launcher"
+# Sandbox override: LLAMA_CPP_LAUNCHER_CONFIG_DIR points the whole app (and
+# every test/smoke run) at an alternative config directory, so development of
+# the second engine can never write into the real ~/.llama-cpp-launcher.
+# Read once at import time — every path below is derived from it.
+CONFIG_DIR = Path(os.environ.get("LLAMA_CPP_LAUNCHER_CONFIG_DIR", "").strip()
+                 or (Path.home() / ".llama-cpp-launcher"))
 PRESETS_DIR = CONFIG_DIR / "presets"
 SETTINGS_FILE = CONFIG_DIR / "settings.json"
 # E3: full (un-truncated) log of the most recent server run
@@ -34,6 +40,32 @@ def _ensure_dirs():
         _dirs_initialized = True
 
 DEFAULT_PRESET = dict(_FALLBACK_DEFAULTS)
+
+# A9: preset keys renamed or removed across llama-server versions. Both the
+# params-dict migration (load_preset) and the key-set migration
+# (preset_stored_keys) read these tables, so the rule lives in one place.
+PRESET_KEY_RENAMES = {"checkpoint_every_n_tokens": "checkpoint_min_step"}
+PRESET_KEY_DROPS = ("ctx_size_draft",)
+
+
+def migrate_preset_keys(params: dict) -> dict:
+    """Apply the preset key renames/removals to a params dict (in place)."""
+    for old, new in PRESET_KEY_RENAMES.items():
+        if old in params and new not in params:
+            params[new] = params.pop(old)
+    for key in PRESET_KEY_DROPS:
+        params.pop(key, None)
+    return params
+
+
+def migrate_preset_key_set(keys) -> set:
+    """Same rule for a bare key set (the protected-keys view)."""
+    keys = set(keys)
+    for old, new in PRESET_KEY_RENAMES.items():
+        if old in keys and new not in keys:
+            keys.discard(old)
+            keys.add(new)
+    return keys - set(PRESET_KEY_DROPS)
 
 
 def _load_settings() -> dict:
@@ -180,8 +212,20 @@ class ConfigManager:
     diff on save and to merge against on load).
     """
 
-    def __init__(self, defaults=None):
+    def __init__(self, defaults=None, schema=None):
         self._defaults = defaults or dict(DEFAULT_PRESET)
+        # Engine seam: an engine schema module may override the preset key
+        # migration; core.config's own tables are the llama.cpp rules and
+        # stay the default so every existing call site is unchanged.
+        self._schema = schema
+
+    def _migrate(self, params):
+        return getattr(self._schema, "migrate_preset_keys",
+                       migrate_preset_keys)(params)
+
+    def _migrate_keys(self, keys):
+        return getattr(self._schema, "migrate_preset_key_set",
+                       migrate_preset_key_set)(keys)
 
     @property
     def defaults(self):
@@ -238,9 +282,7 @@ class ConfigManager:
             return False
         params = dict(params)
         # Migrate param keys renamed/removed across llama-server versions
-        if "checkpoint_every_n_tokens" in params and "checkpoint_min_step" not in params:
-            params["checkpoint_min_step"] = params.pop("checkpoint_every_n_tokens")
-        params.pop("ctx_size_draft", None)
+        self._migrate(params)
         # C3: return the merged params instead of mutating self.current —
         # MainWindow.params is the single source of truth
         merged = dict(self._defaults)
@@ -270,11 +312,7 @@ class ConfigManager:
         keys = set(params.keys())
         # Mirror load_preset()'s cross-version migration so the protected
         # set matches the keys that actually end up in the merged params.
-        if "checkpoint_every_n_tokens" in keys and "checkpoint_min_step" not in keys:
-            keys.discard("checkpoint_every_n_tokens")
-            keys.add("checkpoint_min_step")
-        keys.discard("ctx_size_draft")
-        return keys
+        return self._migrate_keys(keys)
 
     def delete_preset(self, name):
         name = _sanitize_preset_name(name)

@@ -12,6 +12,11 @@ CLAUDE.md
 # Build artifacts
 dist/
 build/
+build_kvmem/
+
+# Local dev sandbox: second-venv and the copied config dir (kvmem engine work)
+.venv/
+.cfg-sandbox/
 
 # Reference docs
 gguf.md

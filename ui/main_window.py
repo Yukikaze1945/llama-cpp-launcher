@@ -47,7 +47,7 @@ from ui.log_parser import colorize_log_line, parse_log_line, line_level
 from ui.command_builder import CommandBuilder, quote_arg
 from ui.runtime_info import build_info_html, empty_info_html
 from core.runner import ServerRunner
-from core.params_schema import PARAMS_BY_KEY
+from core import params_schema
 from core.i18n import t, get_language, set_language
 from ui.model_browser import ModelBrowser
 from ui.basic_panel import BasicPanel, ElidingLabel
@@ -357,7 +357,8 @@ class _ModelMetaWorker(QThread):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, work_dir=None, defaults=None, chat_templates=None, theme=None):
+    def __init__(self, work_dir=None, defaults=None, chat_templates=None,
+                 theme=None, schema=None):
         super().__init__()
         # E5: theme ("light"/"dark"), persisted in settings.json
         self.theme = theme if theme in ("light", "dark") else load_theme()
@@ -368,10 +369,14 @@ class MainWindow(QMainWindow):
         else:
             self.model_dir = self.work_dir
         self.defaults = defaults or {}
-        self.cmd_builder = CommandBuilder(self.defaults)
+        # Engine seam: one parameter module drives the builder, the panels and
+        # the presets. Defaults to core.params_schema (llama.cpp), so the
+        # command line and the UI are byte-for-byte what they were.
+        self._schema = schema or params_schema
+        self.cmd_builder = CommandBuilder(self.defaults, params=self._schema.PARAMS)
         self._version_checked = False
         self.chat_templates = chat_templates or []
-        self.config = ConfigManager(defaults=self.defaults)
+        self.config = ConfigManager(defaults=self.defaults, schema=self._schema)
         self.runner = ServerRunner()
         self.is_advanced = False
         self.params = dict(self.defaults)
@@ -758,8 +763,9 @@ class MainWindow(QMainWindow):
         self.stacked_layout = QVBoxLayout(self.stacked)
         self.stacked_layout.setContentsMargins(0, 0, 0, 0)
 
-        self.basic_panel = BasicPanel(defaults=self.defaults)
-        self.advanced_panel = AdvancedPanel(defaults=self.defaults, chat_templates=self.chat_templates)
+        self.basic_panel = BasicPanel(defaults=self.defaults, schema=self._schema)
+        self.advanced_panel = AdvancedPanel(defaults=self.defaults, chat_templates=self.chat_templates,
+                                            schema=self._schema)
         self.advanced_panel.hide()
 
         self.stacked_layout.addWidget(self.basic_panel)
@@ -2254,7 +2260,8 @@ class MainWindow(QMainWindow):
         # gear button was dropped in favour of the menu as the single
         # customization entry point.
         from ui.quick_params_dialog import QuickParamsDialog
-        dlg = QuickParamsDialog(self, self.basic_panel.get_quick_params())
+        dlg = QuickParamsDialog(self, self.basic_panel.get_quick_params(),
+                                schema=self._schema)
         result = dlg.exec()
         dlg.deleteLater()  # don't leave a hidden top-level behind
         if result == QDialog.DialogCode.Accepted:
@@ -2473,7 +2480,7 @@ class MainWindow(QMainWindow):
             + t("<b>主要功能：</b><br>")
             + t("📦 <b>模型管理</b> — 递归扫描并自动分类本地 GGUF 文件（模型 / mmproj / LoRA，含大小显示），自动匹配同名 mmproj；高级模式还支持 HuggingFace / Docker / URL 指定模型<br>")
             + t("🎛️ <b>基础 / 高级模式</b> — 基础模式滑杆快调常用参数；高级模式 {tabs} 个标签页覆盖 {n} 个 llama-server 参数，每个参数均带 \"?\" 说明<br>",
-                tabs=len(AdvancedPanel._TAB_TITLES), n=len(PARAMS_BY_KEY))
+                tabs=len(self.advanced_panel._TAB_TITLES), n=len(self._schema.PARAMS_BY_KEY))
             + t("🖥️ <b>GPU / 性能</b> — 启动时自动检测 GPU 设备（型号 / 显存），GPU 层卸载、Flash Attention、KV Cache 卸载、多 GPU 张量分割<br>")
             + t("🎲 <b>采样与投机解码</b> — 温度 / Top-P / Top-K / Min-P / 重复惩罚 / DRY / Mirostat 等完整采样参数；草稿模型、ngram、lookup cache 投机解码<br>")
             + t("🌐 <b>服务管理</b> — 主机 / 端口、API 密钥、SSL、CORS、连续批处理、多槽位、router 与 embedding / rerank 模式<br>")

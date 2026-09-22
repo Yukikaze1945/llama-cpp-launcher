@@ -54,8 +54,12 @@ def quote_arg(a) -> str:
 class CommandBuilder:
     """Builds llama-server CLI arguments from a params dict."""
 
-    def __init__(self, defaults):
+    def __init__(self, defaults, params=None):
         self.defaults = defaults
+        # Engine seam: the emitted schema. Defaults to core.params_schema's
+        # PARAMS (the llama.cpp engine) so every existing call site, and the
+        # emitted command line, is unchanged.
+        self.params = PARAMS if params is None else params
 
     def is_default(self, key, v):
         if key not in v:
@@ -189,7 +193,7 @@ class CommandBuilder:
         # afterwards would silently downgrade the user's "log everything"
         # request, so skip it whenever verbose is on.
         verbose_on = bool(v.get("verbose"))
-        for p in PARAMS:
+        for p in self.params:
             if p.key == "log_verbosity" and verbose_on:
                 continue
             args.extend(self._emit(p, v))

@@ -11,7 +11,8 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt
 from core.i18n import t
 from core.constants import DEFAULT_HOST, DEFAULT_PORT, MAIN_GPU_MAX
-from core.params_schema import PARAMS_BY_KEY, TAB_TITLES, UI_PARAMS, tab_params
+from core import params_schema
+from core.params_schema import TAB_TITLES
 from core.params_help import has_help
 from ui.param_help import make_help_button
 
@@ -25,10 +26,18 @@ DRAFT_PRIO_ITEMS = ["normal", "medium", "high", "realtime"]
 
 
 class AdvancedPanel(QWidget):
-    def __init__(self, parent=None, chat_templates=None, defaults=None):
+    def __init__(self, parent=None, chat_templates=None, defaults=None, schema=None):
         super().__init__(parent)
         self._chat_templates = chat_templates or []
         self._defaults = defaults or {}
+        # Engine seam: `schema` is an engine parameter module (core.params_schema
+        # by default, so the panel and its command line are unchanged). The
+        # instance _TAB_TITLES shadows the class attribute, which keeps pointing
+        # at the llama.cpp tabs for _show_about and the test suite.
+        self._schema = params_schema if schema is None else schema
+        self._TAB_TITLES = self._schema.TAB_TITLES
+        self._UI_PARAMS = self._schema.UI_PARAMS
+        self._PARAMS_BY_KEY = self._schema.PARAMS_BY_KEY
         self.init_ui()
         self._apply_defaults()
 
@@ -158,7 +167,7 @@ class AdvancedPanel(QWidget):
         form.setSpacing(8)
         if tab_key == "model":
             form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
-        for p in tab_params(tab_key):
+        for p in self._schema.tab_params(tab_key):
             self._build_param_row(form, p)
             if tab_key == "gpu" and p.key == "tensor_split":
                 # E8: detected GPU devices (from the `--list-devices` probe)
@@ -399,7 +408,7 @@ class AdvancedPanel(QWidget):
                 w.setText(val)
 
     def get_values(self):
-        return {p.key: self._read_param(p) for p in UI_PARAMS
+        return {p.key: self._read_param(p) for p in self._UI_PARAMS
                 if p.wattr is not None}
 
     def set_values(self, values):
@@ -418,7 +427,7 @@ class AdvancedPanel(QWidget):
 
     def _set_values_impl(self, values):
         for key, val in values.items():
-            p = PARAMS_BY_KEY.get(key)
+            p = self._PARAMS_BY_KEY.get(key)
             if p is None or p.wattr is None:
                 continue  # unknown key or schema-only param (prio_batch)
             self._write_param(p, val)
@@ -460,7 +469,7 @@ class AdvancedPanel(QWidget):
             lbl.setText(f"<b>{t(key)}</b>")
 
         # Combo item lists with translatable text (mirostat)
-        for p in UI_PARAMS:
+        for p in self._UI_PARAMS:
             if (p.widget in ("combo", "combo_index") and p.items
                     and any(self._CJK_RE.search(i) for i in p.items)):
                 w = getattr(self, p.wattr)
@@ -471,7 +480,7 @@ class AdvancedPanel(QWidget):
 
         # Placeholders (schema strings containing CJK are translated;
         # ASCII-only placeholders pass through unchanged)
-        for p in UI_PARAMS:
+        for p in self._UI_PARAMS:
             if p.placeholder and self._CJK_RE.search(p.placeholder):
                 w = getattr(self, p.wattr)
                 w.setPlaceholderText(t(p.placeholder))
