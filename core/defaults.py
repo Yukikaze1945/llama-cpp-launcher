@@ -127,21 +127,68 @@ def _parse_bool(text):
 # kind is "value" (typed parser) or "bool". The old parser re-split every help
 # line once per known flag (~300 lines x ~300 flags); now each line is
 # tokenized once and resolved by set intersection.
-_FLAG_INDEX = {}
-for _key, (_flags, _parser) in _VALUE_FLAG_MAP.items():
-    for _f in _flags:
-        _FLAG_INDEX[_f] = (_key, _parser, "value", _flags)
-for _key, _flags in _FLAG_MAP.items():
-    for _f in _flags:
-        _FLAG_INDEX[_f] = (_key, None, "bool", _flags)
-for _key, _flags in _NEG_FLAG_MAP.items():
-    for _f in _flags:
-        _FLAG_INDEX[_f] = (_key, None, "bool", _flags)
+#
+# E-engine: the index is schema-agnostic — build_flag_index() takes the three
+# maps any engine schema's help_flag_maps() returns, so core/defaults_kvmem.py
+# reuses exactly this code with the kvmem table.
+def build_flag_index(value_map, flag_map, neg_map, parser_by_name=None):
+    """flag -> (param_key, parser_callable_or_None, "value"|"bool", flags)."""
+    by_name = _PARSER_BY_NAME if parser_by_name is None else parser_by_name
+    index = {}
+    for key, (flags, parser) in value_map.items():
+        fn = by_name[parser] if isinstance(parser, str) else parser
+        for f in flags:
+            index[f] = (key, fn, "value", flags)
+    for mapping in (flag_map, neg_map):
+        for key, flags in mapping.items():
+            for f in flags:
+                index[f] = (key, None, "bool", flags)
+    return index
+
+
+def index_for_schema(schema):
+    """Reverse --help flag index for any engine schema module."""
+    return build_flag_index(*schema.help_flag_maps())
+
+
+_FLAG_INDEX = build_flag_index(_VALUE_FLAG_MAP, _FLAG_MAP, _NEG_FLAG_MAP)
 _INDEXED_FLAGS = frozenset(_FLAG_INDEX)
 
 
-def _parse_help_to_defaults(help_text):
-    defaults = dict(_FALLBACK_DEFAULTS)
+#: --help strings that mean "no value" rather than a literal default.
+_PLACEHOLDER_DEFAULTS = frozenset({"none", "unused", "disabled"})
+#: llama.cpp keys those placeholders can land on.
+_PLACEHOLDER_KEYS = (
+    "api_key", "api_key_file", "draft_model", "media_path", "slot_save_path",
+    "hf_repo", "hf_file", "model_url", "docker_repo", "mmproj_url",
+    "spec_draft_hf", "models_dir", "models_preset", "tools_runtime",
+    "mcp_servers_config", "mcp_servers_json", "log_prompts_dir",
+)
+
+
+def parse_help_to_defaults(help_text, flag_index, fallbacks, *,
+                           extract_default=None, normalize=None, skip_keys=(),
+                           placeholder_keys=_PLACEHOLDER_KEYS,
+                           placeholder_values=_PLACEHOLDER_DEFAULTS):
+    """Merge an engine's --help defaults onto its fallback baseline.
+
+    Engine-agnostic core shared by llama.cpp (through
+    _parse_help_to_defaults below) and kvmem (core/defaults_kvmem.py):
+
+      flag_index        build_flag_index() output for the engine's schema
+      fallbacks         key -> binary default; keys --help does not reach
+                        simply keep this value
+      extract_default   (combined_text, flags) -> raw string | None
+      normalize         {key: {raw: value}} for help wording a widget cannot
+                        select verbatim (e.g. kvmem's "replay with MTP")
+      skip_keys         keys whose parsed value must never be adopted (a
+                        baseline that would stop us sending what the user sees)
+      placeholder_*     keys whose "none"/"disabled" text means the empty string
+    """
+    extract_default = _extract_default_from_text if extract_default is None else extract_default
+    normalize = normalize or {}
+    skip = frozenset(skip_keys)
+    defaults = dict(fallbacks)
     lines = help_text.split("\n")
 
     for i, line in enumerate(lines):
@@ -162,7 +209,10 @@ def _parse_help_to_defaults(help_text):
             # For -lv that made the live default 4 instead of the
             # binary's 3, so CommandBuilder's is_default() comparison
             # never emitted --log-verbosity and the server ran at its
-            # built-in level 3 despite the UI showing 4.
+            # built-in level 3 despite the UI showing 4.  kvmem needs the
+            # same join: its wrapped entries put the (default X) token on
+            # the continuation line (--kvmem-query-max-tokens,
+            # --reasoning-budget).
             indent = len(nxt) - len(nxt.lstrip(" "))
             if stripped.startswith("-") and indent < 8:
                 break
@@ -170,18 +220,21 @@ def _parse_help_to_defaults(help_text):
             j += 1
 
         tokens = set(line.replace(",", " ").replace("=", " ").split())
-        hits = tokens & _INDEXED_FLAGS
+        hits = tokens & flag_index.keys()
         if not hits:
             continue
         seen_params = set()
         for flag in hits:
-            param_key, parser, kind, flags = _FLAG_INDEX[flag]
-            if param_key in seen_params:
+            param_key, parser, kind, flags = flag_index[flag]
+            if param_key in seen_params or param_key in skip:
                 continue
             seen_params.add(param_key)
-            raw = _extract_default_from_text(combined, flags)
+            raw = extract_default(combined, flags)
             if raw is None:
                 continue
+            per_key = normalize.get(param_key)
+            if per_key and raw in per_key:
+                raw = per_key[raw]
             if kind == "value":
                 try:
                     defaults[param_key] = parser(raw)
@@ -194,15 +247,16 @@ def _parse_help_to_defaults(help_text):
 
     # Normalize placeholder strings from --help to empty string
     # These mean "not set" in llama-server but would display as literal text in the GUI
-    _PLACEHOLDER_DEFAULTS = {"none", "unused", "disabled"}
-    for key in ("api_key", "api_key_file", "draft_model", "media_path", "slot_save_path",
-                "hf_repo", "hf_file", "model_url", "docker_repo", "mmproj_url",
-                "spec_draft_hf", "models_dir", "models_preset", "tools_runtime",
-                "mcp_servers_config", "mcp_servers_json", "log_prompts_dir"):
-        if defaults.get(key) in _PLACEHOLDER_DEFAULTS:
+    for key in placeholder_keys:
+        if defaults.get(key) in placeholder_values:
             defaults[key] = ""
 
     return defaults
+
+
+def _parse_help_to_defaults(help_text):
+    """llama.cpp --help -> defaults (shared engine core, llama extraction rules)."""
+    return parse_help_to_defaults(help_text, _FLAG_INDEX, _FALLBACK_DEFAULTS)
 
 
 def _resolve_server_path(server_path):

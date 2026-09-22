@@ -454,14 +454,19 @@ INITIAL_OVERRIDES = {
 }
 
 #: Keys whose value never comes from --help, even when a future binary starts
-#: printing a parseable default there. Two reasons, both about the same failure
-#: mode (baseline := binary value => the user's visible value stops being sent):
+#: printing a parseable default there. Three reasons, all the same failure mode
+#: (baseline := binary value => the user's visible value stops being sent, or a
+#: drift report cries wolf):
 #:   * the 8 sampling keys, whose defaults are dual-valued ("(1.0 / 0.7)") or
 #:     structured ("(default random)") and cannot be parsed into a scalar;
-#:   * port, which this engine always sends explicitly (see INITIAL_OVERRIDES).
+#:   * port, which this engine always sends explicitly (see INITIAL_OVERRIDES);
+#:   * cache_type_k / cache_type_v, whose "empty = follow --kv-dtype" state has
+#:     no equivalent in --help wording, so adopting q8_0 there would report the
+#:     normal state as drift.
 NO_DRIFT_KEYS = frozenset({
     "temperature", "top_p", "top_k", "min_p", "presence_penalty",
     "frequency_penalty", "repeat_penalty", "seed", "port",
+    "cache_type_k", "cache_type_v",
 })
 
 #: Per-user inputs: a "default" for them is never version drift (same role as
