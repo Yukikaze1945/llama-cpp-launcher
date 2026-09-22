@@ -1092,11 +1092,13 @@ class MainWindow(QMainWindow):
         if "log_level_selector" not in self.engine.supports:
             # The level filter works on llama.cpp's `HH:MM:SS.mmm L ` prefix
             # (ui.log_parser.line_level). v0.16.0-rc2's server writes its own
-            # diagnostics as bare printf lines — measured on the binary: it
-            # carries no logger prefix format ("%.2d.%.2d.%.3d.%.3d %c ") and no
-            # llama_print_system_info/OpenMP text — so its output has no level
-            # token to narrow on. Worse, unticking "E" would hide the exit-1
-            # lines the error dialog needs, so the selector is off here.
+            # diagnostics as bare printf lines: measured on a full IQ3 startup
+            # against the real 12 GB model, 1 of its 2417 output lines carried a
+            # level token (the one common-library line that still uses
+            # LLAMA_LOG), and there is no llama_print_system_info/OpenMP text.
+            # So there is effectively nothing to narrow on — and worse,
+            # unticking "E" would hide the exit-1 lines the error dialog needs.
+            # Hence: the selector is off here.
             for box in self._log_level_boxes.values():
                 box.setVisible(False)
         log_toolbar.addLayout(filter_box)

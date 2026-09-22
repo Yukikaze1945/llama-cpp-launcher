@@ -144,7 +144,7 @@ window is rebuilt around that engine's own parameter table.
 | Build identity | `--version` | read from the install tree (`BUILD-INFO.json`); the binary rejects `--version` |
 | Presets | same folder, tagged `"engine": "llama"` — the 20 legacy files you already have need no migration | tagged `"engine": "kvmem"`, and only those are listed |
 | Mode switch | Basic + Advanced | Advanced only — the basic form is llama.cpp's control set |
-| Extras | device probe, GPU-layer hint, log-level filter | none of those: this build has no `--list-devices` and logs without level prefixes |
+| Extras | device probe, GPU-layer hint, log-level filter | none of those: this build has no `--list-devices`, and its output carries no level tokens to filter on — a full startup against the real 12 GB model produced 2,417 lines of which exactly 1 was level-prefixed |
 
 Two guards are what make the second engine usable, because `llama-kvmem-server`
 is a hand-written argv parser that exits `1` on its first complaint and prints
