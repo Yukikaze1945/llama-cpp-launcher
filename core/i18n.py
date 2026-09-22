@@ -1300,4 +1300,60 @@ _EN = {
     "不能同时发送 --enable-thinking 与 --no-think": "--enable-thinking and --no-think cannot both be sent",
     "与模板文件互斥，只能填一个": "mutually exclusive with the template file, fill in only one",
     '必须是 JSON object，例如 {"key": "value"}': 'must be a JSON object, e.g. {"key": "value"}',
+    # ui/kvmem_linkage.py — behaviour only the kvmem engine's controls have
+    "引擎默认（不发送）": "engine default (not sent)",
+    "随机": "random",
+    "不限制（不发送）": "unlimited (not sent)",
+    "恢复引擎默认（不发送本页参数）": "Restore engine defaults (send nothing from this page)",
+    "把本页每一项参数恢复到服务器二进制自己的默认值。\n命令行只在取值与默认值不同时才发出参数，所以这一步之后本页不再贡献任何 flag。":
+        "Reset every parameter on this page to the server binary's own default.\n"
+        "A flag is emitted only when its value differs from that default, so after this "
+        "step the page contributes nothing to the command line.",
+    "本页参数等于服务器默认值时不会出现在命令行中":
+        "a page parameter equal to the server's default is not emitted",
+    "K 为量化类型时 V 必须与之一致": "a quantized K cache type requires V to be the same type",
+    "上限随 --ctx-size 自动夹逼（当前上限 {n}）": "clamped to --ctx-size (current ceiling {n})",
+    # ui/main_window.py — the post-mortem dialog for a rejected start
+    "服务器拒绝了这次启动": "The server rejected this start",
+    "{engine}: 服务器退出前报告了 {n} 个问题":
+        "{engine}: the server reported {n} problem(s) before it exited",
+    "服务器退出原因已定位：{n} 项参数问题，详见弹窗":
+        "Exit cause identified: {n} parameter issue(s), see the dialog",
+    # core/kvmem_errors.py — the classifier's explanations of the server's own output
+    "这是 llama.cpp 服务器的参数，{engine} 没有对应功能。":
+        "That is a llama.cpp server flag; {engine} has no equivalent feature.",
+    "服务器不认识参数 {flag}。{hint}": "The server does not recognise {flag}. {hint}",
+    "参数 {flag} 后面缺少取值。": "{flag} is missing its value.",
+    "量化 K 必须配同值的 V：K={k} 时 V 也得是 {k}（把 -ctv 改成同一种类型，或两边都留空跟随 --kv-dtype）。":
+        "a quantized K needs an identical V: with K={k}, V must be {k} too "
+        "(set -ctv to the same type, or leave both empty to follow --kv-dtype).",
+    "--spec-kv-dtype 只接受 f16 / q8_0 / q5_0 / q4_0 / f32。":
+        "--spec-kv-dtype accepts only f16 / q8_0 / q5_0 / q4_0 / f32.",
+    "KV 缓存类型只接受 f16 / f32 / q8_0 / q5_0 / q4_0（没有 bf16）。":
+        "KV cache types accept only f16 / f32 / q8_0 / q5_0 / q4_0 (there is no bf16).",
+    "--spec-type 只接受 none 或 draft-mtp，当前是 {v}。（draft-mtp 还需要模型自带 nextn/MTP 头）":
+        "--spec-type accepts none or draft-mtp; currently {v}. "
+        "(draft-mtp also requires the model to ship a nextn/MTP head)",
+    "--kvmem-recent-tokens 必须 >= 0。": "--kvmem-recent-tokens must be >= 0.",
+    "--kvmem-query-max-tokens 必须 > 0。": "--kvmem-query-max-tokens must be > 0.",
+    "--reasoning-budget 必须是 -1 到 2147483647 之间的整数。":
+        "--reasoning-budget must be an integer between -1 and 2147483647.",
+    "这个模型的模板里没有思考结束标记，无法强制思考预算，请把 --reasoning-budget 设回 -1。":
+        "this model's template has no end-of-thinking marker, so a reasoning budget "
+        "cannot be enforced here; set --reasoning-budget back to -1.",
+    '这里必须是 JSON object，例如 {"key": "value"}。':
+        'this must be a JSON object, e.g. {"key": "value"}.',
+    "该参数只接受正整数，0 和负数都会被拒绝。":
+        "this flag takes a positive integer only; 0 and negative values are rejected.",
+    "读不到聊天模板文件：{p}": "cannot read the chat template file: {p}",
+    "（无路径）": "(no path)",
+    "聊天模板无法编译（Jinja 语法或变量与模型不匹配）。":
+        "the chat template could not be compiled (Jinja syntax, or variables that do not match the model).",
+    "本构建在编译时关闭了 NVMe 卸载，任何 --kvmem-nvme-* 都是硬错误。":
+        "NVMe offload is compiled out of this build, so any --kvmem-nvme-* flag is a hard error.",
+    "视觉投影模型加载失败：{p}": "the vision projector failed to load: {p}",
+    "请检查文件是否为 mmproj GGUF。": "check that the file really is an mmproj GGUF.",
+    "模型加载失败：路径不存在、不是本引擎支持的单文件 GGUF，或者显存/内存不够。":
+        "the model failed to load: the path does not exist, it is not a single-file GGUF this "
+        "engine supports, or VRAM/RAM is insufficient.",
 }

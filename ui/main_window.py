@@ -50,11 +50,13 @@ from ui.command_builder import CommandBuilder, quote_arg
 from ui.runtime_info import build_info_html, empty_info_html
 from core.runner import ServerRunner
 from core import engine as engine_mod
+from core import kvmem_errors
 from core import kvmem_identity
 from core.i18n import t, get_language, set_language
 from ui.model_browser import ModelBrowser
 from ui.basic_panel import BasicPanel, ElidingLabel
 from ui.advanced_panel import AdvancedPanel
+from ui import kvmem_linkage
 from ui.gguf_inspector import GGUFInspectorDialog
 from ui.frameless import (TitleBar, FramelessDialog, install_frameless,
                           app_icon)
@@ -460,6 +462,11 @@ class MainWindow(QMainWindow):
         # document itself.
         self._log_html: list[tuple] = []
         self._log_records: list[tuple] = []
+        #: Raw text of the current run's last lines, for the engine's own error
+        #: classifier (core/kvmem_errors). The rendered history above is HTML and
+        #: level-capped, which is the wrong shape for matching `unknown flag:` —
+        #: a rejection is 2-3 lines, and they are the only lines there are.
+        self._recent_log_lines: deque = deque(maxlen=200)
         # Per-level history windows (see LOG_MAX_BLOCK_COUNT): a narrow filter
         # view reads from these, so a flood of hidden levels (-lv 5 debug,
         # prompt dumps) cannot evict the visible level's lines out of the
@@ -872,6 +879,16 @@ class MainWindow(QMainWindow):
                                             schema=self._schema)
         self.advanced_panel.hide()
 
+        if "param_linkage" in self.engine.supports:
+            # kvmem's controls need behaviour a parameter table cannot express
+            # (§5.2-5.6): the "do not send" sentinel wording and its page
+            # buttons, K/V pairing, the thinking tri-state, template
+            # exclusivity, gating, the --n-predict ceiling. It all goes in
+            # through the panel's hook lists, so a llama.cpp panel — whose hook
+            # lists stay empty — is built, read and retranslated exactly as
+            # before.
+            kvmem_linkage.apply_linkage(self.advanced_panel, self.engine)
+
         self.stacked_layout.addWidget(self.basic_panel)
         self.stacked_layout.addWidget(self.advanced_panel)
 
@@ -1072,6 +1089,16 @@ class MainWindow(QMainWindow):
             box.toggled.connect(self._on_log_level_toggled)
             filter_box.addWidget(box)
             self._log_level_boxes[lvl] = box
+        if "log_level_selector" not in self.engine.supports:
+            # The level filter works on llama.cpp's `HH:MM:SS.mmm L ` prefix
+            # (ui.log_parser.line_level). v0.16.0-rc2's server writes its own
+            # diagnostics as bare printf lines — measured on the binary: it
+            # carries no logger prefix format ("%.2d.%.2d.%.3d.%.3d %c ") and no
+            # llama_print_system_info/OpenMP text — so its output has no level
+            # token to narrow on. Worse, unticking "E" would hide the exit-1
+            # lines the error dialog needs, so the selector is off here.
+            for box in self._log_level_boxes.values():
+                box.setVisible(False)
         log_toolbar.addLayout(filter_box)
         log_toolbar.addStretch()
         self.btn_clear_log = QPushButton(t("🗑️ 清空"))
@@ -1460,6 +1487,29 @@ class MainWindow(QMainWindow):
             self.btn_undo.setEnabled(len(self.params_history) > 1)
         self._pending_snapshot = False
 
+    def _jump_to_param(self, key) -> bool:
+        """Open the advanced tab holding one parameter (False: no such control).
+
+        Shared by the two places that have to say "and here is where you fix
+        it": the pre-start validator and the post-mortem error dialog.
+        """
+        param = getattr(self._schema, "PARAMS_BY_KEY", {}).get(key)
+        if param is None or not param.tab:
+            return False
+        self.mode_combo.setCurrentIndex(1)
+        keys = self.advanced_panel.tab_keys()
+        if param.tab not in keys:
+            return False
+        self.advanced_panel.tabs.setCurrentIndex(keys.index(param.tab))
+        return True
+
+    def _param_label(self, key) -> str:
+        """The UI label of a parameter key ("" for a key with no row)."""
+        param = getattr(self._schema, "PARAMS_BY_KEY", {}).get(key)
+        if param is None or not param.label:
+            return ""
+        return t(param.label).rstrip(":：").strip()
+
     def _engine_validation_problems(self, values):
         """Values this engine's parser would reject ([] = nothing to check).
 
@@ -1487,17 +1537,55 @@ class MainWindow(QMainWindow):
         box.setDetailedText("\n".join(lines))
         # Jump straight at the first offender (advanced mode owns the tabs) so
         # the fix is a keystroke away rather than a hunt through six tabs.
-        first = param_keys.get(problems[0][0])
-        if first is not None and first.tab:
-            self.mode_combo.setCurrentIndex(1)
-            keys = self.advanced_panel.tab_keys()
-            if first.tab in keys:
-                self.advanced_panel.tabs.setCurrentIndex(keys.index(first.tab))
+        self._jump_to_param(problems[0][0])
         box.exec()
         box.deleteLater()  # don't leave a hidden top-level behind
         self.statusBar().showMessage(
             t("已阻止启动：{n} 项参数与 {engine} 不兼容",
               n=len(problems), engine=self.engine.display_name), 8000)
+
+    def _engine_error_report(self) -> list:
+        """Explanations of this run's output ([] = nothing recognised).
+
+        A kvmem rejection is the worst kind to read: the argv parser exits 1 on
+        its first unknown flag, so the log holds one bare line and the status
+        bar says "服务异常退出" — which looks like the engine crashed. The
+        classifier names the parameter, and the dialog opens its tab.
+        """
+        if "error_classification" not in self.engine.supports:
+            return []
+        try:
+            return kvmem_errors.classify("\n".join(self._recent_log_lines)) or []
+        except Exception:            # an explanation must never be a second failure
+            logger.exception("engine error classification failed")
+            return []
+
+    def _show_engine_error_dialog(self, hits) -> bool:
+        """The 'which parameter, which line, click to fix it' report."""
+        if not hits:
+            return False
+        named = []
+        for hit in hits:
+            label = self._param_label(hit.get("param", ""))
+            message = hit.get("message", "")      # already translated by classify()
+            named.append(f"{label}: {message}" if label else message)
+        box = ThemedMessageBox(self)
+        box.setWindowTitle(t("服务器拒绝了这次启动"))
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setText(t("{engine}: 服务器退出前报告了 {n} 个问题",
+                      engine=self.engine.display_name, n=len(hits)))
+        box.setInformativeText("\n".join(named[:6]))
+        box.setDetailedText("\n\n".join(
+            f"{hit.get('line', '')}\n    -> {hit.get('message', '')}"
+            for hit in hits))
+        for hit in hits:             # first hit that maps to a control wins
+            if hit.get("param") and self._jump_to_param(hit["param"]):
+                break
+        box.exec()
+        box.deleteLater()
+        self.statusBar().showMessage(
+            t("服务器退出原因已定位：{n} 项参数问题，详见弹窗", n=len(hits)), 8000)
+        return True
 
     def _start_server(self):
         v = self._get_current_values()
@@ -1553,6 +1641,7 @@ class MainWindow(QMainWindow):
         timestamp = datetime.now().strftime('%H:%M:%S')
         # E3: banners go through the record system so they survive filter
         # rebuilds; the full run log captures the command + every line
+        self._recent_log_lines.clear()   # a new run explains only its own output
         self._open_run_log(cmd_str)
         self._log_banner(f'<span style="color: #89b4fa;">[{timestamp}] {t("启动命令:")}</span>')
         self._log_banner(
@@ -1661,6 +1750,10 @@ class MainWindow(QMainWindow):
             self.btn_webui.setEnabled(False)
             self._reset_runtime_state()
             self.statusBar().showMessage(t("❌ 服务异常退出"))
+            # Engine-specific post-mortem: name the parameter the server choked
+            # on instead of leaving "异常退出" as the whole story. Returns False
+            # (and shows nothing) for llama.cpp, which has always ended here.
+            self._show_engine_error_dialog(self._engine_error_report())
 
     def _reset_runtime_state(self):
         self.timer.stop()
@@ -1711,6 +1804,7 @@ class MainWindow(QMainWindow):
         self._log_html.append((line_level(line), colorize_log_line(line)))
         self._parse_log_line(line.strip())
         self._run_log_write(line)
+        self._recent_log_lines.append(line)
 
     def _log_banner(self, html):
         # E3: banners go through the record system (level None = shown only

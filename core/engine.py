@@ -64,7 +64,8 @@ class Engine:
     #: "recommended layer count" hint must not be computed for it.
     probe_devices: bool = True
     #: Feature names the UI asks about instead of testing schemas
-    #: ("chat_templates", "log_level_selector", "identity_file", ...).
+    #: ("chat_templates", "log_level_selector", "identity_file",
+    #: "param_linkage", "error_classification", ...).
     supports: frozenset = frozenset()
     #: Read the build identity off the install tree instead of the binary.
     read_identity: Optional[Callable] = None
@@ -239,7 +240,8 @@ KVMEM = Engine(
     path_example=r"D:\llama-kvmem\bin\llama-kvmem-server.exe",
     probe_version=False,        # rejected: `unknown flag: --version`
     probe_devices=False,        # rejected: `unknown flag: --list-devices`
-    supports=frozenset({"identity_file"}),
+    supports=frozenset({"identity_file", "param_linkage",
+                        "error_classification"}),
     read_identity=kvmem_identity.read_identity,
     describe_identity=kvmem_identity.describe,
 )

@@ -161,6 +161,23 @@ def compile_log_patterns():
     # --- Slot context new format (new: `srv load_model: initializing, n_ctx_slot = 131072`) ---
     _int_comma(["srv", "initializing", "n_ctx_slot"], r"n_ctx_slot\s*=\s*(\d+)", "ctx_size")
 
+    # --- kvmem-llama.cpp's readiness line (the ONLY pattern here that is not
+    #     llama.cpp's; the other ~73 stay shared and simply never match) ------
+    # `listening on http://127.0.0.1:18200  model=Qwen3…gguf kvmem=1 method=retrieval
+    #  n_ctx=262144 spec=draft-mtp n_max=16384 think=1 rbudget=4096 qmax=512`
+    # It is the engine reporting the context it actually got (the request can be
+    # clamped by VRAM), and `n_ctx=` never appears on a llama.cpp `listening on`
+    # line, so the pattern is engine-exclusive by construction. That line is
+    # also kvmem's readiness signal, which the llama.cpp "srv … listening on"
+    # special case below cannot see (no `srv` prefix in its output), so the
+    # status is filled here with the same raw key.
+    def _handle_kvmem_listening(info, m):
+        info["ctx_size"] = f"{int(m.group('n_ctx')):,}"
+        info["status"] = "✅ 服务就绪"
+        return True
+    _add(["listening", "n_ctx=", "kvmem="],
+         r"listening\s+on\s+\S+.*?n_ctx=(?P<n_ctx>\d+)", _handle_kvmem_listening)
+
     # --- Context warning (`llama_context: n_ctx_seq (65536) < n_ctx_train (262144)`,
     #     or the `>` overflow variant; library INFO → visible at -lv 4) ---
     def _handle_ctx_warning(info, m):

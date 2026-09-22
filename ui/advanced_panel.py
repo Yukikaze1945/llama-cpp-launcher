@@ -38,6 +38,19 @@ class AdvancedPanel(QWidget):
         self._TAB_TITLES = self._schema.TAB_TITLES
         self._UI_PARAMS = self._schema.UI_PARAMS
         self._PARAMS_BY_KEY = self._schema.PARAMS_BY_KEY
+        # Engine seam for widget *behaviour* (stage 6): an engine module
+        # (ui/kvmem_linkage.py) registers callables on these lists at window
+        # construction. Empty means "this panel is exactly what it always was",
+        # which is the llama.cpp path — the hooks below are the only place its
+        # read/write/retranslate flow changes, and they loop over nothing.
+        #   _read_hooks(panel, values)       -> after widgets were read into `values`
+        #   _write_hooks(panel, values)      -> before `values` are written to widgets
+        #   _retranslate_extras(panel)       -> after the built-in retranslation
+        self._read_hooks: list = []
+        self._write_hooks: list = []
+        self._retranslate_extras: list = []
+        #: tab key -> the QVBoxLayout of that tab (headers go in at index 0)
+        self._tab_layouts = {}
         self.init_ui()
         self._apply_defaults()
 
@@ -178,7 +191,35 @@ class AdvancedPanel(QWidget):
         scroll.setWidget(content)
         tab_layout = QVBoxLayout(tab)
         tab_layout.addWidget(scroll)
+        self._tab_layouts[tab_key] = tab_layout
         return tab
+
+    def add_tab_header(self, tab_key, widget):
+        """Put an always-visible row above a tab's scrollable form.
+
+        Used by an engine's linkage for its per-page actions (kvmem's
+        "restore engine defaults" button); outside the scroll area so it cannot
+        be scrolled away and is not rewritten by the form.
+        """
+        layout = self._tab_layouts.get(tab_key)
+        if layout is None:
+            return False
+        layout.insertWidget(0, widget)
+        return True
+
+    def param_widget(self, key):
+        """The control for a schema key (None when it has no widget)."""
+        p = self._PARAMS_BY_KEY.get(key)
+        if p is None or not p.wattr:
+            return None
+        return getattr(self, p.wattr, None)
+
+    def param_label(self, key):
+        """The QLabel for a schema key's row (None when it has no widget)."""
+        p = self._PARAMS_BY_KEY.get(key)
+        if p is None or not p.label:
+            return None
+        return self._form_labels.get(p.label)
 
     def _add_widget_row(self, form, p, row_widget, widget=None):
         # Explicit None check: empty Qt models (e.g. a fresh QListWidget)
@@ -408,11 +449,19 @@ class AdvancedPanel(QWidget):
                 w.setText(val)
 
     def get_values(self):
-        return {p.key: self._read_param(p) for p in self._UI_PARAMS
-                if p.wattr is not None}
+        values = {p.key: self._read_param(p) for p in self._UI_PARAMS
+                  if p.wattr is not None}
+        # Engine linkage may add keys no widget owns (kvmem's --enable-thinking
+        # / --no-think are derived from one tri-state combo) and normalise
+        # combinations the parser would otherwise take literally.
+        for hook in self._read_hooks:
+            hook(self, values)
+        return values
 
     def set_values(self, values):
         values = dict(values)
+        for hook in self._write_hooks:
+            hook(self, values)
         try:
             self._set_values_impl(values)
             return
@@ -499,3 +548,7 @@ class AdvancedPanel(QWidget):
                     btn.setText(t("➕ 添加"))
                 elif btn.text() in ("➖ 移除", "➖ Remove"):
                     btn.setText(t("➖ 移除"))
+
+        # Engine linkage extras (reset-button texts, derived-value labels).
+        for extra in self._retranslate_extras:
+            extra(self)
