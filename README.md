@@ -28,6 +28,7 @@ All **226** `llama-server` CLI parameters in one panel · live default detection
 - [Quick Start](#quick-start)
 - [Features](#features)
   - [Two Modes](#two-modes)
+  - [Two Server Engines (`-kvmem` build)](#two-engines)
   - [Advanced Mode — 9 Tabs](#advanced-tabs)
   - [Model Browser](#model-browser)
   - [Real-time Log Parsing](#log-parsing)
@@ -66,7 +67,7 @@ And it stays in sync automatically:
 - **🗂️ Chat template auto-discovery** — templates shipped by your binary appear in the UI automatically.
 - **🖥️ GPU detection** — probes `--list-devices` and shows e.g. `2× GPU: RTX 5090 (32GB) + RTX 2080 (8GB)` next to the offload controls (never auto-fills, always your call).
 
-**🪶 Lightweight & private** — ~13,000 lines of Python, one dependency (PyQt6). No bundled backend, no accounts, no telemetry, no phone home. 100% local.
+**🪶 Lightweight & private** — ~16,000 lines of Python, one dependency (PyQt6). No bundled backend, no accounts, no telemetry, no phone home. 100% local.
 
 <a id="screenshot"></a>
 
@@ -123,6 +124,54 @@ python main.py          # or double-click run.bat on Windows
 | GPU layers auto / all / manual, host/port/parallel | Speculative decoding (draft-mtp, ngram, lookup cache) |
 | ⚡ Quick toggles — **user-configurable** (Settings → Customize): FlashAttn, reasoning, split mode, spec type, draft max… | Full server config: SSL, CORS, slots, embedding/rerank, MCP |
 | *Get a model running in seconds* | *Fine-tune every detail* |
+
+<a id="two-engines"></a>
+
+### 🔌 Two Server Engines — the `-kvmem` build
+
+The official `LlamaCppLauncher.exe` drives `llama-server` and nothing else. A
+second product, **`LlamaCppLauncher-kvmem.exe`**, drives an additional binary
+from the very same window: `llama-kvmem-server.exe` — an independent,
+single-slot OpenAI-compatible server with retrieval-based KV-cache offload and
+MTP speculative decoding. Pick the engine under **设置 / Settings → 引擎: …**; the
+window is rebuilt around that engine's own parameter table.
+
+|  | llama.cpp engine | kvmem engine |
+|---|---|---|
+| Server binary | `llama-server.exe` (path → `PATH` → bare name) | `llama-kvmem-server.exe`, path configured per engine |
+| Parameters | **226** in 9 tabs | **52** in 6 tabs — only what this parser accepts |
+| Defaults | live-parsed from its own `--help` | live-parsed from its own `--help`, drift-checked per engine |
+| Build identity | `--version` | read from the install tree (`BUILD-INFO.json`); the binary rejects `--version` |
+| Presets | same folder, tagged `"engine": "llama"` — the 20 legacy files you already have need no migration | tagged `"engine": "kvmem"`, and only those are listed |
+| Mode switch | Basic + Advanced | Advanced only — the basic form is llama.cpp's control set |
+| Extras | device probe, GPU-layer hint, log-level filter | none of those: this build has no `--list-devices` and logs without level prefixes |
+
+Two guards are what make the second engine usable, because `llama-kvmem-server`
+is a hand-written argv parser that exits `1` on its first complaint and prints
+nothing readable afterwards:
+
+- **before starting** — every value is checked against the ranges, pairings and
+  exclusions that binary really enforces (quantized `-ctk` requires an
+  identical `-ctv`, `--chat-template` excludes `--chat-template-file`,
+  `--chat-template-kwargs` must be a JSON object, …). A rejected value opens a
+  dialog naming the parameter and jumps to its tab, instead of launching a
+  process doomed to exit.
+- **after an unexpected exit** — the run's own output is matched against the 17
+  error strings measured out of the shipped build, so `unknown flag: --parallel`
+  turns into *"That is a llama.cpp server flag; kvmem-llama.cpp has no
+  equivalent feature."* pointing at the free-text box, rather than
+  *"abnormal exit"*.
+
+Everything else follows from the same rule: **a control exists only if the
+server you point at really acts on it.** The rc2 build has no NVMe offload
+compiled in, no multi-GPU, `--parallel` fixed at 1, no independent draft model
+and no `auto` GPU layers — so none of those have a widget here, even though
+`llama-server` has flags for all of them.
+
+The "do not send" sentinels are explicit and visible: a sampling spin sitting at
+its engine default reads `engine default (not sent)` and contributes **no flag**
+to the command line, and each parameter page carries a *Restore engine defaults
+(send nothing from this page)* button that returns it to that state in one click.
 
 <a id="advanced-tabs"></a>
 
@@ -256,8 +305,9 @@ A built-in binary inspector (no weights loaded, pure-stdlib parser):
 ## 🛠️ Development
 
 - Python 3.11+, PyQt6 (pinned), pytest for tests
-- ~13,000 lines of application code (+~5,500 lines of tests); the core schema (`core/params_schema.py`) is the single source of truth for the UI, CLI emission, get/set values, and i18n coverage — adding a parameter is one entry
-- `gguf/`, `ui/log_parser.py`, `ui/command_builder.py` are Qt-free and unit-testable headlessly
+- ~16,000 lines of application code (+~8,000 lines of tests); the core schema (`core/params_schema.py`) is the single source of truth for the UI, CLI emission, get/set values, and i18n coverage — adding a parameter is one entry
+- The schema is *injectable*: `core/engine.py` maps an engine id to its parameter module, defaults module, baseline and capability set, so a second server binary is a table plus a few hooks rather than a fork (`ui/advanced_panel.py`'s `_read_hooks` / `_write_hooks` / `_retranslate_extras` stay empty for llama.cpp, which is why its behaviour is bit-for-bit unchanged)
+- `gguf/`, `ui/log_parser.py`, `ui/command_builder.py`, `core/kvmem_params_schema.py` and `core/kvmem_errors.py` are Qt-free and unit-testable headlessly
 
 <details>
 <summary><b>Project structure</b></summary>
@@ -267,12 +317,18 @@ llama-cpp-launcher/
 ├── main.py                  # Entry point (async startup, logging setup)
 ├── run.bat                  # Windows launcher (activates venv)
 ├── build_config.py          # App name / version (CI rewrites on tag)
-├── llama_cpp_launcher.spec  # PyInstaller spec (icon embedded)
+├── llama_cpp_launcher.spec  # PyInstaller spec (icon embedded) — official exe
+├── llama_cpp_launcher_kvmem.spec  # …-kvmem exe (same app, second engine enabled)
 ├── requirements.txt
 ├── core/
 │   ├── params_schema.py     # ★ 226-param schema (Qt-free, single source of truth)
+│   ├── kvmem_params_schema.py  # ★ 52-param kvmem schema + per-engine validator
+│   ├── engine.py            # Engine registry: schema, defaults, baseline, caps
+│   ├── kvmem_identity.py    # Build identity from the install tree
+│   ├── kvmem_errors.py      # kvmem server output → "which parameter, where"
 │   ├── params_help.py       # Per-parameter help texts (226 entries)
 │   ├── defaults.py          # `--help` parsing, fallback defaults, GPU probe
+│   ├── defaults_kvmem.py    # …for the kvmem binary (per-engine flag index)
 │   ├── config.py            # Preset & settings IO (~/.llama-cpp-launcher)
 │   ├── runner.py            # QProcess wrapper (start/stop/readiness)
 │   ├── i18n.py              # zh/en translation (Chinese source language)
@@ -284,7 +340,8 @@ llama-cpp-launcher/
 │   ├── frameless.py         # Frameless rounded-card window, title bar, edge-resize
 │   ├── message_box.py       # Themed frameless message boxes & dialog base
 │   ├── basic_panel.py       # Basic mode (incl. user-configurable quick toggles)
-│   ├── advanced_panel.py    # Advanced mode (schema-driven, 9 tabs)
+│   ├── advanced_panel.py    # Advanced mode (schema-driven, 9 tabs / 6 for kvmem)
+│   ├── kvmem_linkage.py     # kvmem-only widget behaviour (sentinels, pairing, gating)
 │   ├── quick_params.py      # Quick-toggles pool + widget factory
 │   ├── quick_params_dialog.py  # Customize-quick-toggles dialog
 │   ├── server_path_dialog.py   # llama-server path dialog
@@ -294,13 +351,19 @@ llama-cpp-launcher/
 │   ├── log_parser.py        # Log line patterns → runtime info (Qt-free)
 │   ├── command_builder.py   # Params → `llama-server` argv (Qt-free)
 │   └── runtime_info.py      # Runtime info HTML (Qt-free)
-├── tests/                   # 26 test modules (headless, in-memory fakes)
+├── tests/                   # 38 test modules (headless, in-memory fakes)
 └── assets/icon.ico|png
 ```
 
 </details>
 
 **Releases**: pushing a tag `v*` runs CI on `windows-latest` — tests, then PyInstaller, then the exe is published as a GitHub Release automatically.
+
+**The `-kvmem` build is not published by CI** — the workflow only packages
+`llama_cpp_launcher.spec`. Build it from a clone:
+`pyinstaller --noconfirm --workpath build_kvmem llama_cpp_launcher_kvmem.spec`
+writes the onefile `dist/LlamaCppLauncher-kvmem.exe`. Separate name, separate
+work directory, so it never touches the official exe.
 
 <a id="license"></a>
 

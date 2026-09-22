@@ -28,6 +28,7 @@
 - [快速开始](#quick-start)
 - [功能详解](#features)
   - [双模式设计](#two-modes)
+  - [双服务器引擎（`-kvmem` 版）](#two-engines)
   - [高级模式 — 9 个标签页](#advanced-tabs)
   - [模型浏览器](#model-browser)
   - [实时日志解析](#log-parsing)
@@ -66,7 +67,7 @@
 - **🗂️ 聊天模板自动发现** — 你的二进制内置的模板会自动出现在 UI 中。
 - **🖥️ GPU 检测** — 通过 `--list-devices` 探测，在卸载层数控制旁显示如 `检测到 2× GPU：RTX 5090 (32GB) + RTX 2080 (8GB)`（只展示，不自动填写，永远由你决定）。
 
-**🪶 轻量且私密** — 约 13,000 行 Python，唯一运行时依赖是 PyQt6。无内置后端、无账号、无遥测、不联网上报，100% 本地运行。
+**🪶 轻量且私密** — 约 16,000 行 Python，唯一运行时依赖是 PyQt6。无内置后端、无账号、无遥测、不联网上报，100% 本地运行。
 
 <a id="screenshot"></a>
 
@@ -123,6 +124,47 @@ python main.py          # Windows 下也可双击 run.bat
 | GPU 层数 auto / all / 手动，host/port/并行数 | 投机解码（draft-mtp、ngram、lookup cache） |
 | ⚡ 快捷开关（**可自定义**，设置 → 自定义快捷开关…）：FlashAttn、推理、分割模式、投机类型、草稿 Token 上限… | 完整服务端配置：SSL、CORS、slots、embedding/rerank、MCP |
 | *几秒钟让模型跑起来* | *精细调节每一个细节* |
+
+<a id="two-engines"></a>
+
+### 🔌 双服务器引擎 — `-kvmem` 版
+
+正式版 `LlamaCppLauncher.exe` 只驱动 `llama-server`。第二个产物
+**`LlamaCppLauncher-kvmem.exe`** 在**同一个窗口**里多驱动一个二进制：
+`llama-kvmem-server.exe` —— 独立的单槽位 OpenAI 兼容服务器，带检索式 KV
+缓存卸载与 MTP 投机解码。在 **设置 → 引擎: …** 里选择，窗口会按该引擎的参数表
+重建。
+
+|  | llama.cpp 引擎 | kvmem 引擎 |
+|---|---|---|
+| 服务器二进制 | `llama-server.exe`（配置路径 → `PATH` → 同名命令） | `llama-kvmem-server.exe`，路径按引擎各存一份 |
+| 参数数量 | **226 个**，9 个标签页 | **52 个**，6 个标签页 —— 只收录该 parser 真接受的 |
+| 默认值 | 解析它自己的 `--help` | 解析它自己的 `--help`，逐引擎做版本漂移检测 |
+| 构建身份 | `--version` | 读安装目录的 `BUILD-INFO.json`（该二进制拒绝 `--version`） |
+| 预设 | 同一目录，文件内标记 `"engine": "llama"`；你已有的 20 个旧预设无需迁移 | 标记 `"engine": "kvmem"`，列表里也只出现这些 |
+| 模式 | 基础 + 高级 | 只有高级 —— 基础面板是 llama.cpp 的那套控件 |
+| 附加能力 | 设备探测、显存推荐层数、日志级别筛选 | 都没有：这个构建没有 `--list-devices`，日志也不带级别前缀 |
+
+真正让这个引擎可用的是两道拦截，因为 `llama-kvmem-server` 是手写的 argv
+parser：**碰到第一个不满就 exit 1，之后什么可读的都不打**。
+
+- **启动前** —— 每个取值都按这个二进制真正强制的范围、配对与互斥规则校验
+  （量化 `-ctk` 必须配同值 `-ctv`、`--chat-template` 与 `--chat-template-file`
+  互斥、`--chat-template-kwargs` 必须是 JSON object …）。不通过就弹窗点名参数
+  并跳到它所在的标签页，而不是去启一个必死的进程。
+- **异常退出后** —— 把这次运行的输出与从发布二进制里逐条量出来的 17 条报错文案
+  比对，于是 `unknown flag: --parallel` 会变成
+  「这是 llama.cpp 服务器的参数，kvmem-llama.cpp 没有对应功能。」并指向附加参数
+  输入框，而不是只剩一句「服务异常退出」。
+
+其余一切都遵循同一条规则：**只有你指向的那个服务器真会响应的参数，才配有控件。**
+rc2 构建编译期关闭了 NVMe 卸载、不支持多 GPU、`--parallel` 固定为 1、没有独立
+草稿模型、也没有 `auto` GPU 层数 —— 所以这些在 kvmem 引擎下一个控件都没有，尽管
+`llama-server` 对每一项都有 flag。
+
+「不发送」哨兵是显式且看得见的：停在引擎默认值上的采样框显示
+`引擎默认（不发送）`，对命令行**不贡献任何 flag**；每个参数页顶部还有一个
+「恢复引擎默认（不发送本页参数）」按钮，一键把整页退回这个状态。
 
 <a id="advanced-tabs"></a>
 
@@ -256,8 +298,9 @@ python main.py          # Windows 下也可双击 run.bat
 ## 🛠️ 开发
 
 - Python 3.11+，PyQt6（版本锁定），pytest 测试
-- 约 13,000 行应用代码（另有约 5,500 行测试）；核心 schema（`core/params_schema.py`）是 UI、CLI 命令生成、get/set 值、i18n 覆盖率的唯一事实来源 — 新增一个参数只需一条记录
-- `gguf/`、`ui/log_parser.py`、`ui/command_builder.py` 均不依赖 Qt，可无界面单元测试
+- 约 16,000 行应用代码（另有约 8,000 行测试）；核心 schema（`core/params_schema.py`）是 UI、CLI 命令生成、get/set 值、i18n 覆盖率的唯一事实来源 — 新增一个参数只需一条记录
+- schema 是**可注入的**：`core/engine.py` 把引擎 id 映射到它的参数模块、默认值模块、基线与能力集，所以接第二个服务器二进制是「加一张表 + 几个钩子」而不是 fork；`ui/advanced_panel.py` 的 `_read_hooks` / `_write_hooks` / `_retranslate_extras` 对 llama.cpp 永远为空，这正是它行为逐字节不变的原因
+- `gguf/`、`ui/log_parser.py`、`ui/command_builder.py`、`core/kvmem_params_schema.py`、`core/kvmem_errors.py` 均不依赖 Qt，可无界面单元测试
 
 <details>
 <summary><b>项目结构</b></summary>
@@ -267,12 +310,18 @@ llama-cpp-launcher/
 ├── main.py                  # 入口（异步启动、日志配置）
 ├── run.bat                  # Windows 启动脚本（激活 venv）
 ├── build_config.py          # 应用名 / 版本（CI 按 tag 改写）
-├── llama_cpp_launcher.spec  # PyInstaller 构建配置（内嵌图标）
+├── llama_cpp_launcher.spec  # PyInstaller 构建配置（内嵌图标）— 正式版 exe
+├── llama_cpp_launcher_kvmem.spec  # …-kvmem 版（同一个程序，开放第二引擎）
 ├── requirements.txt
 ├── core/
 │   ├── params_schema.py     # ★ 226 参数 schema（Qt-free，唯一事实来源）
+│   ├── kvmem_params_schema.py  # ★ 52 参数 kvmem schema + 每引擎参数校验
+│   ├── engine.py            # 引擎注册表：schema、默认值、基线、能力集
+│   ├── kvmem_identity.py    # 从安装目录读取构建身份
+│   ├── kvmem_errors.py      # kvmem 服务器输出 → 「哪个参数、去哪儿改」
 │   ├── params_help.py       # 逐参数帮助文本（226 条）
 │   ├── defaults.py          # `--help` 解析、回退默认值、GPU 探测
+│   ├── defaults_kvmem.py    # kvmem 二进制的对应实现（逐引擎 flag 索引）
 │   ├── config.py            # 预设与设置 IO（~/.llama-cpp-launcher）
 │   ├── runner.py            # QProcess 封装（启动/停止/就绪检测）
 │   ├── i18n.py              # 中/英翻译（中文为源语言）
@@ -284,7 +333,8 @@ llama-cpp-launcher/
 │   ├── frameless.py         # 无边框圆角卡片窗口、标题栏、边缘缩放
 │   ├── message_box.py       # 主题化无边框消息框与对话框基类
 │   ├── basic_panel.py       # 基础模式（含可自定义快捷开关）
-│   ├── advanced_panel.py    # 高级模式（schema 驱动，9 标签页）
+│   ├── advanced_panel.py    # 高级模式（schema 驱动，llama 9 页 / kvmem 6 页）
+│   ├── kvmem_linkage.py     # 仅 kvmem 的控件行为（哨兵文案、KV 配对、门控）
 │   ├── quick_params.py      # 快捷开关候选池 + 控件工厂
 │   ├── quick_params_dialog.py  # 自定义快捷开关对话框
 │   ├── server_path_dialog.py   # llama-server 路径对话框
@@ -294,13 +344,17 @@ llama-cpp-launcher/
 │   ├── log_parser.py        # 日志行模式 → 运行时信息（Qt-free）
 │   ├── command_builder.py   # 参数 → `llama-server` argv（Qt-free）
 │   └── runtime_info.py      # 运行时信息 HTML（Qt-free）
-├── tests/                   # 26 个测试模块（无界面，内存假数据）
+├── tests/                   # 38 个测试模块（无界面，内存假数据）
 └── assets/icon.ico|png
 ```
 
 </details>
 
 **发布**：推送 `v*` tag 触发 CI（windows-latest）— 跑测试 → PyInstaller 打包 → 自动发布 exe 到 GitHub Release。
+
+**`-kvmem` 版不由 CI 发布** — 工作流只打包 `llama_cpp_launcher.spec`。想要它请在本地
+clone 里执行 `pyinstaller --noconfirm --workpath build_kvmem llama_cpp_launcher_kvmem.spec`，
+产出单文件 `dist/LlamaCppLauncher-kvmem.exe`：名字独立、工作目录独立，绝不覆盖正式版 exe。
 
 <a id="license"></a>
 

@@ -1,0 +1,65 @@
+# -*- mode: python ; coding: utf-8 -*-
+# Second build product: the dual-engine launcher (kvmem-llama.cpp alongside
+# llama.cpp). A SEPARATE spec on purpose — see the plan's §"打包":
+#
+#   * `build_config.APP_NAME` stays "LlamaCppLauncher", so the official spec and
+#     the assertions in .github/workflows/release.yml are untouched;
+#   * the name gets a "-kvmem" suffix so the two exes can never overwrite each
+#     other (the official install lives in E:\llama_launcher\, this one goes to
+#     E:\llama_launcher_kvmem\);
+#   * --workpath build_kvmem keeps PyInstaller's intermediates out of build/;
+#   * no extra hiddenimports: every kvmem module (core.kvmem_params_schema,
+#     core.kvmem_errors, core.engine, ui.kvmem_linkage) is imported statically,
+#     so Analysis reaches them normally.
+#
+# Build:
+#   .venv/Scripts/pyinstaller --noconfirm --workpath build_kvmem \
+#       llama_cpp_launcher_kvmem.spec
+import os
+import sys
+
+# Add current directory to path so we can import build_config
+sys.path.insert(0, os.path.abspath('.'))
+import build_config
+
+a = Analysis(
+    ['main.py'],
+    pathex=[],
+    binaries=[],
+    # Bundle the window icon as a data file so main.py can apply it at
+    # runtime (the EXE's PE icon below only covers file-explorer/shortcut/
+    # taskbar, not Qt's title-bar icon). Extracts to <_MEIPASS>/assets/.
+    datas=[('assets/icon.ico', 'assets')] if os.path.exists('assets/icon.ico') else [],
+    hiddenimports=[
+        # Launcher version (ui/main_window.py imports APP_VERSION for the
+        # window title and the About dialog)
+        'build_config',
+        'PyQt6.sip',
+        'PyQt6.QtCore',
+        'PyQt6.QtGui',
+        'PyQt6.QtWidgets',
+    ],
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=[],
+    noarchive=False,
+    optimize=1,
+)
+
+pyz = PYZ(a.pure)
+
+exe = EXE(
+    pyz,
+    a.scripts,
+    a.binaries,
+    a.datas,
+    [],
+    name=build_config.APP_NAME + "-kvmem",
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=True,
+    console=False,
+    icon='assets/icon.ico' if os.path.exists('assets/icon.ico') else None,
+)
