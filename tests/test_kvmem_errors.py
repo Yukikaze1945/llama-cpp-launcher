@@ -137,7 +137,9 @@ def test_the_acceptance_7_route_really_reaches_the_binary_verbatim():
 
 @pytest.mark.parametrize("line", [
     "unknown flag: --frobnicate",
-    "unknown flag: --kvmem-nvme-gb",
+    # Names like one of ours but is not in the parser at all. (The real NVMe
+    # flags *are* known — see test_nvme_rejection_has_no_control_to_point_at.)
+    "unknown flag: --kvmem-nvme-gb-x",
 ])
 def test_an_unknown_flag_that_is_not_llamas_gets_no_wrong_hint(line):
     h = hit(line)

@@ -34,11 +34,16 @@ Hard rules encoded here:
     param each; the alias list in `flags` only feeds the --help index).
   * features this build cannot do have NO control at all: NVMe
     (`--kvmem-nvme-gb/-dir`, `--kvmem-raw-k-nvme` exit 1 — NVMe is compiled
-    out), `--jinja` (no-op, and unticking a merged box would emit the rejected
-    `--no-jinja`), `--parallel`/`--device`/`--tensor-split` (single slot),
+    out), `--jinja` (accepted but inert — native Jinja rendering is always on,
+    and unticking a merged box would emit the rejected `--no-jinja`),
+    `--parallel`/`--device`/`--tensor-split` (single slot),
     `--model-draft`/`-ngld`, `-ub`, `-fa`, `--lora`, `-t`, `--mlock/--no-mmap`,
     `--verbose`/`-v`/`--log-verbosity`/`-lv`, `--api-key`/CORS,
-    `--list-devices`. REJECTED_FLAGS pins that list for the tests.
+    `--list-devices`. The two lists split those by what the *parser* does:
+    REJECTED_FLAGS holds the ones probed live as `unknown flag`, and
+    NO_CONTROL_KEYS the ones it accepts (so --help lists them and a reader
+    wonders where the widget is) that this schema deliberately leaves without
+    one.
 
 `Param` gains no field, `CommandBuilder._emit` gains no mode, and
 `core/params_schema.py` is not touched: engine-specific behaviour is expressed
@@ -64,6 +69,17 @@ KVMEM_CTK_TYPE_ITEMS = [""] + KVMEM_CACHE_TYPE_ITEMS
 KVMEM_SPEC_TYPE_ITEMS = ["none", "draft-mtp"]
 # --spec-kv-dtype reports its accepted set in this order
 KVMEM_SPEC_KV_TYPE_ITEMS = ["f16", "q8_0", "q5_0", "q4_0", "f32"]
+
+#: Suggestions for the editable --reasoning-effort combo — the one item list
+#: here that is NOT a hard set. --help types the flag as `LEVEL`, and the server
+#: special-cases only two of these strings ("default uses template default, none
+#: disables thinking"), forwarding the rest to the model template. The shipped
+#: Qwen3.8 GSQ template accepts xhigh (its default), medium and low and raises
+#: for anything else, so those three plus none and default are the five levels
+#: that actually work here; "high" is not one of them, which is why it is not
+#: offered. A custom template may define its own levels, so the combo stays
+#: editable and validate_params() rule 2 treats this list as suggestions.
+REASONING_EFFORT_ITEMS = ["none", "default", "low", "medium", "xhigh"]
 
 TAB_TITLES = (
     ("model", "模型"),
@@ -313,9 +329,10 @@ PARAMS = (
       label='推理力度 (--reasoning-effort):', wattr='adv_reasoning_effort',
       widget='combo_edit', default='', emit='diff_nonempty', fmt='str',
       flag='--reasoning-effort', flags=('--reasoning-effort',), parser='str',
-      items=("none", "low", "medium", "high"), value='combo_edit',
+      items=REASONING_EFFORT_ITEMS, value='combo_edit',
       placeholder="留空 = 使用模板默认",
-      tooltip="none 会关闭思考，与“开启思考”互斥；其余取值由模型模板解释"),
+      tooltip="none 会关闭思考，与「开启思考」互斥；下拉项只是建议值，"
+              "自定义模板的其他 effort 会原样传给模板解释"),
     P(key='reasoning_budget', tab='reasoning', row=2,
       label='思考 Token 预算 (--reasoning-budget):', wattr='adv_reasoning_budget',
       widget='spin', default=-1, emit='diff', fmt='int',
@@ -516,25 +533,33 @@ BASIC_OWNED_KEYS = frozenset({
     "host", "port",
 })
 
-#: Flags the parser rejects in this build (probed live against
-#: v0.16.0-rc2). Pinned by tests/test_kvmem_flags_accepted.py so a future
-#: schema edit cannot quietly add a control for something that exits 1.
+#: Flags the argv parser refuses in this build, each one probed live against
+#: v0.16.0-rc2 as `unknown flag: X` + usage + exit 1. Pinned by
+#: tests/test_kvmem_flags_accepted.py so a future schema edit cannot quietly add
+#: a control for something that exits 1.
+#:
+#: "Refused" is the whole membership test, and it is deliberately narrower than
+#: "cannot be used": a flag the parser *accepts* belongs in NO_CONTROL_KEYS even
+#: when using it is fatal. `--jinja` (accepted, inert) and the three NVMe flags
+#: (accepted, then "NVMe offload is disabled in this build") are exactly that —
+#: the first version of this list had them here, which mislabels what the schema
+#: is allowed to emit. `--no-jinja` on the other hand is a real rejection.
 REJECTED_FLAGS = (
     "--version", "--verbose", "-v", "--parallel", "--list-devices",
     "--model-draft", "-ngld", "-ub", "--ubatch-size", "--flash-attn", "-fa",
-    "--mlock", "--no-mmap", "--api-key", "--no-jinja", "--jinja",
+    "--mlock", "--no-mmap", "--api-key", "--no-jinja",
     "--device", "--tensor-split", "--threads", "-t", "--log-verbosity",
     "-lv", "--no-webui", "--webui",
-    "--kvmem-nvme-gb", "--kvmem-nvme-dir", "--kvmem-raw-k-nvme",
 )
 
 #: Help-visible flags with no control on purpose, and why. The Tier3 test
 #: asserts none of them is in PARAMS_BY_KEY.
 NO_CONTROL_KEYS = {
-    "--kvmem-nvme-gb": "本构建 NVMe 编译关闭，非零值直接 exit 1",
+    "--kvmem-nvme-gb": "parser 接受，但本构建 NVMe 编译关闭，非零值直接 exit 1",
     "--kvmem-nvme-dir": "只在 nvme_bytes>0 时才被读取，而那是硬错误",
-    "--kvmem-raw-k-nvme": "需要 NVMe，exit 1",
-    "--jinja": "no-op；合并成复选框会在取消勾选时发出被拒的 --no-jinja",
+    "--kvmem-raw-k-nvme": "parser 接受，但需要 NVMe，exit 1",
+    "--jinja": "parser 接受但没有任何作用（Jinja 渲染始终开启）；"
+               "合并成复选框会在取消勾选时发出被拒的 --no-jinja",
 }
 
 #: Cache types whose K forces V to be identical (measured: `--kv-dtype f32
@@ -592,12 +617,16 @@ def validate_params(values: dict) -> list:
         elif hi is not None and value > hi:
             bad(key, t("取值不得大于 {hi}（当前 {v}）", hi=hi, v=value))
 
-    # 2. list-valued flags. Combos already restrict the choices, but a preset
-    #    imported from the other engine shares key names (spec_type, chat_*)
-    #    whose values are not in this set — `unsupported --spec-type` is a
-    #    parse-time exit, so it is checked here as well.
+    # 2. list-valued flags. A non-editable combo already restricts the choices
+    #    in the UI, but a preset imported from the other engine shares key names
+    #    (spec_type, chat_*) whose values are not in this set — `unsupported
+    #    --spec-type` is a parse-time exit, so it is checked here as well.
+    #    combo_edit is skipped on purpose: an editable combo's items are
+    #    suggestions, and --reasoning-effort is the case that proves it (the
+    #    parser takes any string and the model template decides, so a custom
+    #    template's own level must reach the command line).
     for param in UI_PARAMS:
-        if not param.items or param.widget not in ("combo", "combo_edit"):
+        if not param.items or param.widget != "combo":
             continue
         value = get(param.key)
         if value is None or value == "":

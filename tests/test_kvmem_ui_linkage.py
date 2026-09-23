@@ -253,6 +253,23 @@ def test_contradictory_pair_resolves_to_off(panel, cb):
     assert "--no-think" in argv and "--enable-thinking" not in argv
 
 
+def test_reasoning_effort_combo_suggests_without_locking(panel, cb):
+    """Editable on purpose: the list is what the shipped templates understand
+    (xhigh/medium/low plus the server's own none/default), and a custom template
+    may name its own levels — the parser takes any string, so what is typed has
+    to reach argv. `high` is llama.cpp's ladder, not this one's."""
+    w = panel.param_widget("reasoning_effort")
+    assert w.isEditable()
+    assert [w.itemText(i) for i in range(w.count())] == list(K.REASONING_EFFORT_ITEMS)
+    assert "high" not in [w.itemText(i) for i in range(w.count())]
+    w.setEditText("xhigh")
+    argv = argv_for(panel, cb)
+    assert argv[argv.index("--reasoning-effort") + 1] == "xhigh"
+    w.setEditText("minimal")
+    argv = argv_for(panel, cb)
+    assert argv[argv.index("--reasoning-effort") + 1] == "minimal"
+
+
 # ---------------------------------------------------------------------------
 # §5.5 — chat template exclusivity
 # ---------------------------------------------------------------------------
@@ -348,7 +365,7 @@ def test_n_predict_ceiling_never_eats_the_sentinel(panel):
 def test_two_language_switches_keep_every_value(panel, language):
     panel.set_values({"temperature": 0.7, "top_k": 40, "ctx_size": 32768,
                       "kvmem_method": "recency", "thinking_mode": K.THINKING_ON,
-                      "cache_type_k": "q5_0", "reasoning_effort": "high",
+                      "cache_type_k": "q5_0", "reasoning_effort": "xhigh",
                       "no_ui": True, "chat_template_kwargs": '{"a": 1}'})
     before = panel.get_values()
     for lang in ("en", "zh", "en", "zh"):

@@ -136,6 +136,12 @@ single-slot OpenAI-compatible server with retrieval-based KV-cache offload and
 MTP speculative decoding. Pick the engine under **设置 / Settings → 引擎: …**; the
 window is rebuilt around that engine's own parameter table.
 
+That choice is remembered — `settings.json` gets `"engine": "llama"` or
+`"engine": "kvmem"`, including the deliberate llama.cpp — and it wins over
+everything else on the next start. Only a configuration that never picked an
+engine is auto-detected: there, a `server_path` already pointing at
+`llama-kvmem-server.exe` opens the kvmem engine without rewriting anything.
+
 |  | llama.cpp engine | kvmem engine |
 |---|---|---|
 | Server binary | `llama-server.exe` (path → `PATH` → bare name) | `llama-kvmem-server.exe`, path configured per engine |

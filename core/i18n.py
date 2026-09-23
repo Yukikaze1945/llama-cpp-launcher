@@ -1223,7 +1223,7 @@ _EN = {
     "关闭思考": "Thinking off",
     "推理力度 (--reasoning-effort):": "Reasoning effort (--reasoning-effort):",
     "留空 = 使用模板默认": "Empty = use the template default",
-    "none 会关闭思考，与“开启思考”互斥；其余取值由模型模板解释": "none disables thinking and conflicts with Thinking on; other values are interpreted by the model template",
+    "none 会关闭思考，与「开启思考」互斥；下拉项只是建议值，自定义模板的其他 effort 会原样传给模板解释": "none switches thinking off, which conflicts with Thinking on; the list is only a set of suggestions — another effort level from a custom template is passed to the template as typed",
     "思考 Token 预算 (--reasoning-budget):": "Thinking token budget (--reasoning-budget):",
     "-1 = 不限制（引擎默认，不发送）；0 = 立即结束思考；N>0 强制在第 N 个 token 处收尾": "-1 = unlimited (engine default, not sent); 0 ends thinking immediately; N>0 forces </think> after N thinking tokens",
     "强制收尾提示 (--reasoning-budget-message):": "Forced-stop message (--reasoning-budget-message):",

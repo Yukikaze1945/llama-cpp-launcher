@@ -283,10 +283,17 @@ def server_path_for(engine_id: str) -> str:
 def resolve_startup_engine() -> Engine:
     """Engine for this session: explicit preference, else sniff the paths.
 
-    Sniffing matters right now: a settings.json whose `server_path` already
-    points at llama-kvmem-server.exe gets the kvmem schema with no config
-    rewrite at all, instead of the current behaviour (llama flags sent to a
-    kvmem binary -> `unknown flag` -> exit 1).
+    The preference wins even when it names llama.cpp: "llama" in settings.json
+    is a choice the user made in 设置 → 引擎, and on a machine where both
+    binaries are configured, sniffing would otherwise reopen the window in
+    kvmem every time they switch back and restart. Only a *missing* `engine`
+    key means "never chosen", which is what load_preferred_engine_id reports
+    as "".
+
+    Sniffing then matters for those installs: a settings.json whose
+    `server_path` already points at llama-kvmem-server.exe gets the kvmem
+    schema with no config rewrite at all, instead of the previous behaviour
+    (llama flags sent to a kvmem binary -> `unknown flag` -> exit 1).
     """
     from core.config import load_preferred_engine_id
     engine_id = load_preferred_engine_id()

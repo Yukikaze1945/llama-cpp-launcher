@@ -233,7 +233,12 @@ def _engine_key(key: str, engine_id: str) -> str:
 
 
 def load_preferred_engine_id() -> str:
-    """Which engine this install drives ("" = not chosen -> detect it).
+    """Which engine this install drives ("" = never chosen -> detect it).
+
+    "" means the settings file has no `engine` key — an install written before
+    a second engine existed, where sniffing the configured paths is the right
+    guess. It is NOT the same as a stored "llama": that is an explicit choice
+    and must survive a restart (see save_preferred_engine_id).
 
     No validation here: core.engine.get_engine_by_id() maps anything unknown
     back to llama.cpp, which is exactly the pre-kvmem behaviour, and importing
@@ -244,11 +249,20 @@ def load_preferred_engine_id() -> str:
 
 
 def save_preferred_engine_id(engine_id: str):
+    """Record the engine the user picked — including llama.cpp itself.
+
+    Storing "llama" is the point. Popping the key for llama.cpp, as the first
+    version of this function did, made an explicit choice indistinguishable
+    from "never chosen", so the next startup of an install that has both
+    binaries configured fell back to resolve_startup_engine()'s path sniffing
+    and could reopen in kvmem after the user had said llama.cpp. Passing "" is
+    the one way to clear the choice back to "detect it".
+    """
     settings = _load_settings()
-    if engine_id and engine_id != LLAMA_ENGINE_ID:
+    if engine_id:
         settings[_PREFERRED_ENGINE_KEY] = engine_id
     else:
-        settings.pop(_PREFERRED_ENGINE_KEY, None)  # absent = llama.cpp
+        settings.pop(_PREFERRED_ENGINE_KEY, None)  # "" = not chosen
     _save_settings(settings)
 
 

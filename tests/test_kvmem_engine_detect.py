@@ -144,6 +144,9 @@ def test_resolve_startup_engine(monkeypatch, tmp_path):
     from core import config as CC
     monkeypatch.setattr(CC, "load_preferred_engine_id", lambda: "kvmem")
     assert E.resolve_startup_engine() is E.KVMEM
+    # An explicit llama.cpp choice is a preference too, not "no preference".
+    monkeypatch.setattr(CC, "load_preferred_engine_id", lambda: "llama")
+    assert E.resolve_startup_engine() is E.LLAMA
     monkeypatch.setattr(CC, "load_preferred_engine_id", lambda: "")
     monkeypatch.setattr(CC, "get_configured_server_path", lambda engine_id: "")
     assert E.KVMEM.server_path() == ""
@@ -154,4 +157,45 @@ def test_resolve_startup_engine(monkeypatch, tmp_path):
     fake.write_bytes(b"MZ")
     monkeypatch.setattr(CC, "get_configured_server_path",
                         lambda engine_id: str(fake) if engine_id == "llama" else "")
+    assert E.resolve_startup_engine() is E.KVMEM
+
+
+def test_explicit_llama_choice_survives_a_restart(tmp_path, monkeypatch):
+    """Regression: both binaries configured, the user picks llama.cpp, restarts.
+
+    settings.json is the only thing a restart carries over, so this is the real
+    sequence — both paths saved, then the 设置 → 引擎 choice, with no loader
+    monkeypatched and the path resolution cache dropped in between (that cache
+    is the one piece of in-process state a new process would not have).
+    """
+    from core import config as CC
+    settings = tmp_path / "settings.json"
+    monkeypatch.setattr(CC, "SETTINGS_FILE", settings)
+
+    def restart():
+        monkeypatch.setattr(CC, "_server_path_cache", None)
+
+    restart()
+    llama_exe = tmp_path / "llama-server.exe"
+    llama_exe.write_bytes(b"MZ")
+    kvmem_exe = tmp_path / "llama-kvmem-server.exe"
+    kvmem_exe.write_bytes(b"MZ")
+    CC.save_server_path(str(llama_exe), engine_id="llama")
+    CC.save_server_path(str(kvmem_exe), engine_id="kvmem")
+    # Setup check: this install really is the ambiguous one. Without a recorded
+    # choice, sniffing finds the kvmem binary first.
+    assert CC.load_preferred_engine_id() == ""
+    restart()
+    assert E.resolve_startup_engine() is E.KVMEM
+    # 设置 → 引擎 → llama.cpp, then a restart.
+    CC.save_preferred_engine_id("llama")
+    restart()
+    assert E.resolve_startup_engine() is E.LLAMA
+    # Symmetrically, choosing kvmem sticks (and clearing the choice goes back
+    # to sniffing, which is what the pre-kvmem install relied on).
+    CC.save_preferred_engine_id("kvmem")
+    restart()
+    assert E.resolve_startup_engine() is E.KVMEM
+    CC.save_preferred_engine_id("")
+    restart()
     assert E.resolve_startup_engine() is E.KVMEM

@@ -135,6 +135,11 @@ python main.py          # Windows 下也可双击 run.bat
 缓存卸载与 MTP 投机解码。在 **设置 → 引擎: …** 里选择，窗口会按该引擎的参数表
 重建。
 
+这个选择会被记住：`settings.json` 里写下 `"engine": "llama"` 或
+`"engine": "kvmem"`（明确选 llama.cpp 也一样写），下次启动它优先于其它任何判断。
+只有从没选过引擎的旧配置才自动检测——这时若 `server_path` 已经指向
+`llama-kvmem-server.exe`，就直接按 kvmem 引擎打开，不改写任何配置。
+
 |  | llama.cpp 引擎 | kvmem 引擎 |
 |---|---|---|
 | 服务器二进制 | `llama-server.exe`（配置路径 → `PATH` → 同名命令） | `llama-kvmem-server.exe`，路径按引擎各存一份 |

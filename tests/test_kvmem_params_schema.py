@@ -8,6 +8,8 @@ engine — the second schema has to hold the same lines or the shared UI code
 import json
 import re
 
+import pytest
+
 from core import i18n as I
 from core import kvmem_params_schema as K
 
@@ -237,6 +239,46 @@ def test_thinking_tristate_uses_two_independent_emitters():
     for key in ("enable_thinking", "no_think"):
         p = K.PARAMS_BY_KEY[key]
         assert p.wattr is None and p.emit == "bool_pos" and p.default is False
+
+
+def test_reasoning_effort_items_are_the_levels_that_work():
+    """`high` is llama.cpp's vocabulary; this build's ladder is different.
+
+    Measured: the --help line reads "template effort; default uses template
+    default, none disables thinking", and the shipped Qwen3.8 GSQ template
+    raises for anything outside xhigh (its default) / medium / low. Before this
+    list was fixed the schema offered `high` and the validator *rejected*
+    `xhigh`, i.e. it blocked the only value that works.
+    """
+    p = K.PARAMS_BY_KEY["reasoning_effort"]
+    assert list(p.items) == K.REASONING_EFFORT_ITEMS
+    assert set(p.items) == {"none", "default", "low", "medium", "xhigh"}
+    assert "high" not in p.items
+    assert p.widget == "combo_edit"  # editable: the items suggest, they do not lock
+
+
+@pytest.mark.parametrize("effort", ["default", "low", "medium", "xhigh",
+                                    "minimal", "think_hard"])
+def test_reasoning_effort_is_not_a_hard_whitelist(effort):
+    """A custom chat template may define its own levels, and the parser accepts
+    any string (`--reasoning-effort bogus` passes), so anything but the `none`
+    collision has to reach the command line unchecked."""
+    values = dict(K.fallback_defaults(), reasoning_effort=effort,
+                  thinking_mode=K.THINKING_ON)
+    assert "reasoning_effort" not in dict(K.validate_params(values))
+
+
+def test_reasoning_effort_none_still_collides_with_thinking_on():
+    """The one effort value the server acts on itself switches thinking off, so
+    the pair stays a contradiction (rule 4) — that is the exception, not a
+    whitelist."""
+    values = dict(K.fallback_defaults(), reasoning_effort="none",
+                  thinking_mode=K.THINKING_ON)
+    assert "reasoning_effort" in dict(K.validate_params(values))
+    for mode in (K.THINKING_TEMPLATE_DEFAULT, K.THINKING_OFF):
+        values = dict(K.fallback_defaults(), reasoning_effort="none",
+                      thinking_mode=mode)
+        assert "reasoning_effort" not in dict(K.validate_params(values))
 
 
 def test_schema_i18n_coverage():

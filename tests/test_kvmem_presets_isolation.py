@@ -184,13 +184,18 @@ def test_legacy_server_path_honoured_only_for_its_own_binary(tmp_path, monkeypat
 def test_preferred_engine_round_trip(tmp_path, monkeypatch):
     settings = tmp_path / "settings.json"
     monkeypatch.setattr(CC, "SETTINGS_FILE", settings)
-    assert CC.load_preferred_engine_id() == ""       # absent = llama.cpp
+    assert CC.load_preferred_engine_id() == ""       # absent key = never chosen
     CC.save_preferred_engine_id("kvmem")
     assert CC.load_preferred_engine_id() == "kvmem"
     assert json.loads(settings.read_text(encoding="utf-8"))["engine"] == "kvmem"
-    # Choosing llama.cpp removes the key rather than writing "llama", so the
-    # settings file of someone who switches back is what the official build wrote.
+    # Choosing llama.cpp stores "llama" instead of removing the key. Those two
+    # states have to stay distinguishable: "" is "never chosen, go sniffing",
+    # "llama" is "this user said llama.cpp" (see test_explicit_llama_choice…).
     CC.save_preferred_engine_id("llama")
+    assert CC.load_preferred_engine_id() == "llama"
+    assert json.loads(settings.read_text(encoding="utf-8"))["engine"] == "llama"
+    # "" is the one value that clears the choice again.
+    CC.save_preferred_engine_id("")
     assert CC.load_preferred_engine_id() == ""
     assert "engine" not in json.loads(settings.read_text(encoding="utf-8"))
 
