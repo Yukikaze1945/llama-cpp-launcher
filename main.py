@@ -12,6 +12,7 @@ def _get_work_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 
+from PyQt6.QtCore import QEvent
 from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import QApplication
 
@@ -151,6 +152,18 @@ def main():
     window.show()
     rc = app.exec()
     _log_exit_state(app)
+    # Delete the widgets here instead of letting ~QApplication do it. Interpreter
+    # teardown interleaves the window's and the app's C++ destructor chains (the
+    # race tests/conftest.py pins), and with the KVMem VRAM card on the parameter
+    # page that faulted inside sip's wrapper cast on 2-8 of 12 launches. After the
+    # flush below topLevelWidgets() is empty and the tree dies while the app is
+    # still alive: 28 consecutive clean exits with the card mounted, 8 with it
+    # off. Nothing else services the deferred-delete queue once exec() has
+    # returned, so sendPostedEvents() is what deletes - processEvents() alone
+    # leaves every widget alive.
+    for _top in app.topLevelWidgets():
+        _top.deleteLater()
+    app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
     sys.exit(rc)
 
 
