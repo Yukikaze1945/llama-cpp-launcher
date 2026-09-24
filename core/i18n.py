@@ -1356,4 +1356,78 @@ _EN = {
     "模型加载失败：路径不存在、不是本引擎支持的单文件 GGUF，或者显存/内存不够。":
         "the model failed to load: the path does not exist, it is not a single-file GGUF this "
         "engine supports, or VRAM/RAM is insufficient.",
+
+    # === vram_panel.py / vram_monitor.py (KVMem VRAM prediction card) ===
+    # Card rows
+    "预计峰值": "Predicted peak",
+    "经验安全峰值": "Safe peak (learned)",
+    "当前空闲": "Currently free",
+    "安全余量": "Headroom",
+    "建议 KVMem Budget": "Suggested KVMem budget",
+    "成功样本数": "Learned samples",
+    "置信度": "Confidence",
+    "采用建议 Budget": "Apply Suggested Budget",
+    "预测仅供参考，只有点击按钮才会写入 --kvmem-budget":
+        "Predictions are advisory: --kvmem-budget changes only when you press the button.",
+    # Confidence words and which bound produced U
+    "低": "Low",
+    "中": "Medium",
+    "高": "High",
+    "结构估算（首次运行）": "structural estimate (first run)",
+    "小样本上界": "small-sample bound",
+    "经验 P95": "empirical P95",
+    # Values
+    "{n} 次": "{n} runs",
+    "尚无": "none yet",
+    "不可用": "unavailable",
+    "无安全值": "no safe value",
+    # Notes the predictor owns
+    "正在解析模型结构…": "Parsing model structure…",
+    "尚未选择模型文件": "No model file selected yet",
+    "模型结构解析失败：{m}": "model structure could not be parsed: {m}",
+    "建议 Budget 已写入 --kvmem-budget 控件":
+        "Suggested budget written into the --kvmem-budget control",
+    "KVMem 未启用：本次预测不含 KV 池": "KVMem is off: this prediction has no KV pool",
+    "模型结构未能解析，权重按 0 计（预测不可信）":
+        "model structure unresolved, weights counted as 0 (prediction unreliable)",
+    "部分层卸载无法按层切分权重，已按整模型计入（偏保守）":
+        "partial offload cannot be split by layer, so the whole model is counted (conservative)",
+    "模型结构缺少 {m}，预测为降级值":
+        "model structure is missing {m}; the prediction is degraded",
+    "当前空闲显存放不下最小的 KV 池，没有安全 Budget":
+        "the free memory does not fit the smallest KV pool, so there is no safe budget",
+    "建议值已受 --kvmem-gpu-ratio 上限约束": "the suggestion is capped by --kvmem-gpu-ratio",
+    "显存采样不可用：{r}": "GPU memory sampling unavailable: {r}",
+    "未找到 NVML 或 nvidia-smi": "no NVML and no nvidia-smi found",
+    # Why a finished run was not allowed to teach the model
+    "本次以显存不足结束，未用于学习":
+        "this run ended out of memory and was not used for learning",
+    "本次未启动就绪，未用于学习":
+        "this run never became ready and was not used for learning",
+    "本次参数被引擎拒绝，未用于学习":
+        "the engine rejected a parameter this run; not used for learning",
+    "本次非正常结束，未用于学习":
+        "this run ended uncleanly and was not used for learning",
+    "本次显存被其他进程扰动，未用于学习":
+        "another process disturbed the memory this run; not used for learning",
+    "本次仅有粗粒度采样，未用于学习":
+        "this run was only sampled coarsely; not used for learning",
+    "本次启动前未采到基线，未用于学习":
+        "no baseline was sampled before the launch; not used for learning",
+    "本次未采到运行样本，未用于学习":
+        "no sample was taken while it ran; not used for learning",
+    "本次结束后未采到基线，未用于学习":
+        "no baseline was sampled after it stopped; not used for learning",
+    "本次显存未增长，未用于学习":
+        "memory usage never grew this run; not used for learning",
+    "本次没有可用测量，未用于学习":
+        "there was no usable measurement this run; not used for learning",
+    "本次测量明显失真，未用于学习":
+        "this run's measurement was implausible; not used for learning",
+    "本次测量无效，未用于学习":
+        "this run's measurement was invalid; not used for learning",
+    "本次与已学习配置不符，未用于学习":
+        "this run did not match a learned profile; not used for learning",
+    "本次学习被跳过": "learning was skipped this run",
+    "本次未用于学习": "this run was not used for learning",
 }

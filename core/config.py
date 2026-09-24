@@ -30,6 +30,9 @@ SETTINGS_FILE = CONFIG_DIR / "settings.json"
 # E3: full (un-truncated) log of the most recent server run
 LOGS_DIR = CONFIG_DIR / "logs"
 LAST_RUN_LOG = LOGS_DIR / "last_run.log"
+# VRAM prediction: RLS state + the recent successful residuals, keyed per
+# GPU / engine build / model fingerprint. Numbers only — never prompt text.
+VRAM_LEARNING_FILE = CONFIG_DIR / "vram_learning.json"
 
 _dirs_initialized = False
 

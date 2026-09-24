@@ -97,6 +97,19 @@ def get_type_name(type_id: int) -> str:
     return GGML_TYPES.get(type_id, f"UNKNOWN_{type_id}")
 
 
+_TYPE_ID_BY_NAME: dict[str, int] = {name.lower(): tid for tid, name in GGML_TYPES.items()}
+
+
+def type_id_from_name(name: str) -> int | None:
+    """Inverse of get_type_name(); None for an unknown dtype string."""
+    return _TYPE_ID_BY_NAME.get((name or "").strip().lower())
+
+
+def get_type_info(type_id: int) -> tuple[int, int] | None:
+    """(block_size, bytes_per_block) for a ggml_type id, or None if unknown."""
+    return _Q_TYPE_INFO.get(type_id)
+
+
 def is_quantized_type(type_id: int) -> bool:
     """Check if a type is a quantized (non-plain) type."""
     plain_types = {0, 1, 24, 25, 26, 27, 28, 30}  # F32, F16, I8, I16, I32, I64, F64, BF16

@@ -29,6 +29,7 @@ All **226** `llama-server` CLI parameters in one panel · live default detection
 - [Features](#features)
   - [Two Modes](#two-modes)
   - [Two Server Engines (`-kvmem` build)](#two-engines)
+  - [VRAM Prediction & Online Calibration (`-kvmem` only)](#vram-prediction)
   - [Advanced Mode — 9 Tabs](#advanced-tabs)
   - [Model Browser](#model-browser)
   - [Real-time Log Parsing](#log-parsing)
@@ -67,7 +68,7 @@ And it stays in sync automatically:
 - **🗂️ Chat template auto-discovery** — templates shipped by your binary appear in the UI automatically.
 - **🖥️ GPU detection** — probes `--list-devices` and shows e.g. `2× GPU: RTX 5090 (32GB) + RTX 2080 (8GB)` next to the offload controls (never auto-fills, always your call).
 
-**🪶 Lightweight & private** — ~16,000 lines of Python, one dependency (PyQt6). No bundled backend, no accounts, no telemetry, no phone home. 100% local.
+**🪶 Lightweight & private** — ~19,000 lines of Python, one dependency (PyQt6). No bundled backend, no accounts, no telemetry, no phone home. 100% local.
 
 <a id="screenshot"></a>
 
@@ -178,6 +179,64 @@ The "do not send" sentinels are explicit and visible: a sampling spin sitting at
 its engine default reads `engine default (not sent)` and contributes **no flag**
 to the command line, and each parameter page carries a *Restore engine defaults
 (send nothing from this page)* button that returns it to that state in one click.
+
+<a id="vram-prediction"></a>
+
+### 🧮 VRAM Prediction & Online Calibration — the `-kvmem` build only
+
+The kvmem engine's **KVMem page** carries a read-only card on top: it works out
+how much memory *this* run will really take, then inverts that into the largest
+`--kvmem-budget` that still fits. On the llama.cpp engine the card, its sampling
+thread, its learning file and the launch delay it can introduce do not exist.
+
+| Card field | What it is |
+|---|---|
+| Predicted peak | Weights + KV pool + MTP pool + mmproj from the structure, plus the residual learned on this machine |
+| Safe peak (learned) | Predicted peak + safety margin |
+| Currently free | Live free / total from NVML |
+| Headroom | Free − safe peak |
+| Suggested KVMem budget | The biggest budget that fits the free memory, found by a block-granular search |
+| Learned samples · Confidence | How many runs taught it, and which tier the safety margin came from |
+
+The numbers come from three layers:
+
+1. **Physical model** — a copy of rc2's `kvmem_compute_pool()`: `budget` and
+   `gen_reserve` are each aligned down to `--kvmem-block-tokens` separately (one
+   block minimum), `gen_reserve` 0 means 256, a `budget` of 0 never pools more
+   than `-c`, and `--kvmem-gpu-ratio` caps on the main-KV slot size alone. Bytes
+   per token come out of the GGUF — layer counts, head sizes, row sizes and
+   quantisation type — and once a run has logged `KVMEM_KV_BYTES`,
+   `KVMem slot-pool` or `KVMEM_TRACE mtp_pool`, the engine's own figures win.
+2. **Online residual learning** — each finished run turns its measured whole-card
+   peak minus the physical estimate into one residual, fitted by RLS with a
+   0.995 forgetting factor. It learns the bias of *this card, this build, this
+   model*, not a universal constant.
+3. **One-sided safety bound** — structural headroom with no samples, the largest
+   positive error with 1–4, residual P95 from five onwards: the estimate can only
+   ever be learned conservative, never optimistic.
+
+**A prediction never touches a parameter.** Nothing on the card is editable, and
+the only write path is the *Apply Suggested Budget* button — one click puts the
+number into the `--kvmem-budget` control, and the command line is still generated
+from the parameter table alone.
+
+Learning state lives in `vram_learning.json` in the config directory, keyed by
+GPU name + card size + engine build + model structure fingerprint, at most 64
+residuals per profile. It stores numbers only: no prompts, no chat content, no
+model content.
+
+These runs are **not** allowed to teach the model, and the card says which one it
+was: ended out of memory, never reached ready, parameters rejected by the engine,
+killed uncleanly, another process moving the card's memory, no pre-start
+baseline, or only coarse sampling — a 1 s `nvidia-smi` poll can step over a short
+peak, and an under-measured peak would shrink the safety bound, the wrong
+direction to err in.
+
+Sampling prefers NVML through `ctypes` (no new dependency, ~75 ms per read) and
+falls back to `nvidia-smi` only when it is unavailable. Before a launch the card
+takes a short baseline window (~450 ms on NVML) to establish what the card looked
+like before this run; with no GPU or driver it simply has fewer numbers to show,
+and the launch waits not at all.
 
 <a id="advanced-tabs"></a>
 
@@ -311,7 +370,7 @@ A built-in binary inspector (no weights loaded, pure-stdlib parser):
 ## 🛠️ Development
 
 - Python 3.11+, PyQt6 (pinned), pytest for tests
-- ~16,000 lines of application code (+~8,000 lines of tests); the core schema (`core/params_schema.py`) is the single source of truth for the UI, CLI emission, get/set values, and i18n coverage — adding a parameter is one entry
+- ~19,000 lines of application code (+~11,000 lines of tests); the core schema (`core/params_schema.py`) is the single source of truth for the UI, CLI emission, get/set values, and i18n coverage — adding a parameter is one entry
 - The schema is *injectable*: `core/engine.py` maps an engine id to its parameter module, defaults module, baseline and capability set, so a second server binary is a table plus a few hooks rather than a fork (`ui/advanced_panel.py`'s `_read_hooks` / `_write_hooks` / `_retranslate_extras` stay empty for llama.cpp, which is why its behaviour is bit-for-bit unchanged)
 - `gguf/`, `ui/log_parser.py`, `ui/command_builder.py`, `core/kvmem_params_schema.py` and `core/kvmem_errors.py` are Qt-free and unit-testable headlessly
 

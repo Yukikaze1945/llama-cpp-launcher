@@ -81,6 +81,76 @@ def line_level(line):
     return m.group(1) if m else None
 
 
+def _as_number(text):
+    """Coerce a regex group to int, then float; None when it is not a number."""
+    if text is None:
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        pass
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _merge_ints(target, values):
+    """Write numeric log fields into `target`, skipping unparseable groups.
+
+    Latest line wins: kvmem re-reports the pool when it resizes, and the newer
+    report describes the memory that is actually mapped now.
+    """
+    for key, raw in values.items():
+        n = _as_number(raw)
+        if n is not None:
+            target[key] = n
+
+
+MIB = 1 << 20
+
+
+def kvmem_actual_alloc(info, rate_only=False):
+    """Map the parsed kvmem allocation reports into a vram_estimator `actual` dict.
+
+    Read-only on purpose: it returns a new dict instead of adding keys to
+    `info`, so the llama.cpp runtime panel keeps exactly the dict it always had.
+    The engine's own byte counts outrank the estimator's arithmetic (plan A2),
+    and everything here is what the engine reported for the run that produced
+    `info`.
+
+    `rate_only=True` drops the two *totals* (`kv_bytes`, `mtp_bytes`), which
+    describe the one budget that run used and would freeze a sweep over other
+    budgets; the per-token rates and the mapped weight size hold for any budget
+    and stay in.
+    """
+    alloc = info.get("kvmem_alloc") or {}
+    out = {}
+    keys = ("mtp_k_row_bytes", "mtp_v_row_bytes", "gpu_total_bytes")
+    if not rate_only:
+        keys = ("kv_bytes", "mtp_bytes") + keys
+    for key in keys:
+        v = alloc.get(key)
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0:
+            out[key] = v
+    # block_bytes is a whole main-KV slot, i.e. block_tokens * (row_k + row_v).
+    # Dividing it recovers the engine's per-token rate, which stays valid when
+    # the budget changes — unlike kv_bytes, that only describes this one pool.
+    # Refuse to divide unless it divides exactly: a remainder would mean the
+    # two lines disagree, and a wrong rate poisons the gpu_ratio cap.
+    slot_bytes = alloc.get("slot_bytes")
+    block_tokens = alloc.get("pool_block_tokens")
+    if (isinstance(slot_bytes, int) and isinstance(block_tokens, int)
+            and slot_bytes > 0 and block_tokens > 0
+            and slot_bytes % block_tokens == 0):
+        out["kv_per_token_bytes"] = slot_bytes // block_tokens
+    # "GPU model buffer size = N MiB" is the mapped weight size, and once a run
+    # has produced it it beats any file-based estimate.
+    bufs = info.get("model_bufs") or {}
+    gpu_mib = sum(v for k, v in bufs.items() if not k.startswith("CPU"))
+    if gpu_mib > 0:
+        out["model_vram_bytes"] = int(round(gpu_mib * MIB))
+    return out
 
 
 def compile_log_patterns():
@@ -177,6 +247,96 @@ def compile_log_patterns():
         return True
     _add(["listening", "n_ctx=", "kvmem="],
          r"listening\s+on\s+\S+.*?n_ctx=(?P<n_ctx>\d+)", _handle_kvmem_listening)
+
+    # --- kvmem-llama.cpp's own allocation report ---------------------------
+    # These four lines are the engine stating what it actually mapped, which is
+    # why they are parsed as numbers (into info["kvmem_alloc"]) instead of the
+    # display strings used everywhere else: the VRAM estimator takes them as
+    # truth over its own arithmetic. Unit names follow the engine's wording —
+    # `pool`/`cells` are tokens, `slots`/`cap_blocks` are blocks.
+    def _handle_kvmem_kv_bytes(info, m):
+        alloc = info.setdefault("kvmem_alloc", {})
+        _merge_ints(alloc, {
+            "kv_bytes": m.group("bytes"), "pool_cells": m.group("pool"),
+            "line_cells": m.group("cells"), "slots": m.group("slots"),
+            "budget": m.group("budget"), "ratio": m.group("ratio"),
+            "high": m.group("high"), "low": m.group("low"),
+            "cap_slots": m.group("cap_blocks"),
+            "gpu_total_bytes": m.group("gpu_total"), "slot_bytes": m.group("block_bytes"),
+        })
+        return True
+    _add("kvmem_kv_bytes",
+         r"KVMEM_KV_BYTES bytes=(?P<bytes>\d+) cells=(?P<cells>\d+) slots=(?P<slots>\d+) "
+         r"budget=(?P<budget>\d+) pool=(?P<pool>\d+) ratio=(?P<ratio>[\d.]+) "
+         r"high=(?P<high>[\d.]+) low=(?P<low>[\d.]+) cap_blocks=(?P<cap_blocks>\d+) "
+         r"gpu_total=(?P<gpu_total>\d+) block_bytes=(?P<block_bytes>\d+)",
+         _handle_kvmem_kv_bytes)
+
+    def _handle_kvmem_mtp_pool(info, m):
+        alloc = info.setdefault("kvmem_alloc", {})
+        _merge_ints(alloc, {
+            "mtp_bytes": m.group("bytes"), "mtp_cells": m.group("cells"),
+            "mtp_target_cells": m.group("target_cells"), "mtp_layers": m.group("layers"),
+            "mtp_block_tokens": m.group("block_tokens"),
+            "mtp_k_row_bytes": m.group("k_row_bytes"), "mtp_v_row_bytes": m.group("v_row_bytes"),
+            "mtp_v_trans": m.group("v_trans"),
+        })
+        alloc["mtp_type_k"] = m.group("type_k")
+        alloc["mtp_type_v"] = m.group("type_v")
+        return True
+    _add("mtp_pool",
+         r"KVMEM_TRACE mtp_pool cells=(?P<cells>\d+) target_cells=(?P<target_cells>\d+) "
+         r"n_ctx=(?P<n_ctx>\d+) bytes=(?P<bytes>\d+) layers=(?P<layers>\d+) "
+         r"block_tokens=(?P<block_tokens>\d+) type_k=(?P<type_k>\S+) type_v=(?P<type_v>\S+) "
+         r"k_row_bytes=(?P<k_row_bytes>\d+) v_row_bytes=(?P<v_row_bytes>\d+) "
+         r"v_trans=(?P<v_trans>\d+)",
+         _handle_kvmem_mtp_pool)
+
+    def _handle_kvmem_slot_pool(info, m):
+        alloc = info.setdefault("kvmem_alloc", {})
+        _merge_ints(alloc, {
+            "pool_line_cells": m.group("cells"), "pool_line_slots": m.group("slots"),
+            "pool_block_tokens": m.group("block_tokens"), "pool_budget": m.group("budget"),
+            "pool_gen_reserve": m.group("gen_reserve"), "pool_sink_slots": m.group("sink_blocks"),
+            "pool_harvest_v": m.group("harvest_v"), "pool_n_embd_k": m.group("n_embd_k"),
+            "pool_attn_layers": m.group("attn_layers"),
+        })
+        alloc["pool_method"] = m.group("method")
+        alloc["pool_type_k"] = m.group("type_k")
+        alloc["pool_type_v"] = m.group("type_v")
+        return True
+    _add(["kvmem slot-pool"],
+         r"KVMem slot-pool cells=(?P<cells>\d+) slots=(?P<slots>\d+) "
+         r"block_tokens=(?P<block_tokens>\d+) budget=(?P<budget>\d+) "
+         r"gen_reserve=(?P<gen_reserve>\d+) sink_blocks=(?P<sink_blocks>\d+) "
+         r"method=(?P<method>\S+) harvest_v=(?P<harvest_v>\d+) type_k=(?P<type_k>\S+) "
+         r"type_v=(?P<type_v>\S+) n_embd_k=(?P<n_embd_k>\d+) attn_layers=(?P<attn_layers>\d+)",
+         _handle_kvmem_slot_pool)
+
+    def _handle_kvmem_gdn_allocation(info, m):
+        alloc = info.setdefault("kvmem_alloc", {})
+        alloc["gdn_mode"] = m.group("mode")
+        _merge_ints(alloc, {"gdn_recurrent_bytes": m.group("recurrent_bytes"),
+                            "gdn_conv_bytes": m.group("conv_bytes"),
+                            "gdn_rollback_bytes": m.group("rollback_bytes")})
+        return True
+    _add("kvmem_gdn_allocation",
+         r"KVMEM_GDN_ALLOCATION mode=(?P<mode>\S+) recurrent_bytes=(?P<recurrent_bytes>\d+) "
+         r"conv_bytes=(?P<conv_bytes>\d+) rollback_bytes=(?P<rollback_bytes>\d+)",
+         _handle_kvmem_gdn_allocation)
+
+    def _handle_kvmem_gdn_memory(info, m):
+        alloc = info.setdefault("kvmem_alloc", {})
+        _merge_ints(alloc, {"gdn_layers": m.group("layers"), "gdn_capacity": m.group("capacity"),
+                            "gdn_state_bytes": m.group("state_bytes"),
+                            "gdn_record_bytes": m.group("record_bytes"),
+                            "gdn_descriptor_bytes": m.group("descriptor_bytes")})
+        return True
+    _add("kvmem_gdn_memory",
+         r"KVMEM_GDN_MEMORY mode=(?P<mode>\S+) layers=(?P<layers>\d+) "
+         r"capacity=(?P<capacity>\d+) state_bytes=(?P<state_bytes>\d+) "
+         r"record_bytes=(?P<record_bytes>\d+) descriptor_bytes=(?P<descriptor_bytes>\d+)",
+         _handle_kvmem_gdn_memory)
 
     # --- Context warning (`llama_context: n_ctx_seq (65536) < n_ctx_train (262144)`,
     #     or the `>` overflow variant; library INFO → visible at -lv 4) ---

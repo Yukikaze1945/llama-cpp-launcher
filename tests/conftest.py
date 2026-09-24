@@ -1,8 +1,36 @@
 """Shared pytest fixtures for the llama-cpp-launcher test suite."""
 import gc
+from contextlib import contextmanager
 
 import pytest
 from PyQt6.QtWidgets import QApplication
+
+
+@contextmanager
+def silenced_qt_method(cls, name):
+    """Replace an inherited Qt/C++ method for a test, then put *inheritance* back.
+
+    `monkeypatch.setattr(cls, name, fake)` captures `getattr(cls, name)` and
+    restores it by assignment. For a sip method that is wrong: `QThread.start`
+    resolves to a `builtin_function_or_method`, which binds no `self`, so the
+    restore leaves a permanently broken class attribute — every later
+    `instance.start()` in the session dies with "first argument of unbound
+    method must have type 'QThread'". Which test notices depends on file order,
+    so the damage is invisible in a single-file run.
+
+    Deleting is the only restore that returns the class to its original state
+    (`name` was never in its own `__dict__` to begin with).
+    """
+    own = name in cls.__dict__
+    original = cls.__dict__.get(name)
+    setattr(cls, name, lambda *a, **k: None)
+    try:
+        yield
+    finally:
+        if own:
+            setattr(cls, name, original)
+        else:
+            delattr(cls, name)
 
 
 @pytest.fixture(scope="session", autouse=True)

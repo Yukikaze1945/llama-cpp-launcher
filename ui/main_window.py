@@ -56,6 +56,7 @@ from core.i18n import t, get_language, set_language
 from ui.model_browser import ModelBrowser
 from ui.basic_panel import BasicPanel, ElidingLabel
 from ui.advanced_panel import AdvancedPanel
+from ui.vram_monitor import VramPredictor
 from ui import kvmem_linkage
 from ui.gguf_inspector import GGUFInspectorDialog
 from ui.frameless import (TitleBar, FramelessDialog, install_frameless,
@@ -500,6 +501,11 @@ class MainWindow(QMainWindow):
         self._undo_debounce.setSingleShot(True)
         self._undo_debounce.timeout.connect(self._flush_snapshot)
         self._runtime_info = {}
+        # VRAM prediction (kvmem only). None = this window never looks at the
+        # GPU, i.e. the llama.cpp path unchanged; _pending_launch is the launch
+        # deferred by the pre-start memory baseline.
+        self._vram = None
+        self._pending_launch = None
         self._current_state = None
         self._mode_switching = False
         # Engine switch (设置 → 引擎) rebuilds the window: the flag keeps
@@ -888,6 +894,12 @@ class MainWindow(QMainWindow):
             # lists stay empty — is built, read and retranslated exactly as
             # before.
             kvmem_linkage.apply_linkage(self.advanced_panel, self.engine)
+            # The read-only VRAM card on the KVMem page: it owns its own polling
+            # thread, learning state and prediction, and reaches this window for
+            # parameters only through _get_current_values().
+            self._vram = VramPredictor(self, self._get_current_values)
+            if not self._vram.install():
+                self._vram = None
 
         self.stacked_layout.addWidget(self.basic_panel)
         self.stacked_layout.addWidget(self.advanced_panel)
@@ -1651,14 +1663,50 @@ class MainWindow(QMainWindow):
         )
         self._log_banner("")
 
-        self.runner.start(args, work_dir=str(self.work_dir), server_path=binary)
+        wait_ms = self._vram_arm()
+        if wait_ms:
+            # The baseline has to be sampled while none of this run is on the
+            # card, so the spawn waits for it (_fire_pending_launch).
+            self._pending_launch = (args, binary)
+            self.btn_start.setEnabled(False)
+            QTimer.singleShot(wait_ms, self._fire_pending_launch)
+        else:
+            self._runner_start(args, binary)
         msg = t("🔄 正在启动服务: http://{host}:{port}", host=host, port=port)
         if host == "0.0.0.0":
             msg += t("  ⚠️ 监听所有网卡，局域网可访问")
         self.statusBar().showMessage(msg)
         return True
 
+    # -- VRAM prediction hooks (all inert when self._vram is None) --------
+    def _vram_arm(self) -> int:
+        """Arm the pre-start memory baseline; ms to wait, 0 when not measuring."""
+        if self._vram is None:
+            return 0
+        try:
+            return int(self._vram.arm_launch() or 0)
+        except Exception:                # a missing GPU must never block a launch
+            logger.exception("VRAM baseline could not be armed")
+            return 0
+
+    def _runner_start(self, args, binary):
+        self.runner.start(args, work_dir=str(self.work_dir), server_path=binary)
+        if self._vram is not None:
+            self._vram.begin_run()
+
+    def _fire_pending_launch(self):
+        pending, self._pending_launch = self._pending_launch, None
+        if pending is None:
+            # Stopped during the baseline window: put the button back, the
+            # runner never reached "starting" so no state change will.
+            self.btn_start.setEnabled(not self.runner.is_running)
+            return
+        if self.runner.is_running:
+            return
+        self._runner_start(*pending)
+
     def _stop_server(self):
+        self._pending_launch = None
         self.runner.stop()
         self._close_run_log()
         self.timer.stop()
@@ -1715,6 +1763,8 @@ class MainWindow(QMainWindow):
 
     def _on_state_changed(self, state):
         self._current_state = state
+        if self._vram is not None:
+            self._vram.note_state(state)
         if state == "starting":
             self.status_indicator.setText(t("🔄 启动中..."))
             self.status_indicator.setStyleSheet("color: #d97706; font-weight: bold; font-size: 13px;")
@@ -1758,6 +1808,10 @@ class MainWindow(QMainWindow):
             self._show_engine_error_dialog(self._engine_error_report())
 
     def _reset_runtime_state(self):
+        if self._vram is not None:
+            # Right here, before the wipe: this is the last moment both the
+            # run's parsed allocation lines and its log tail exist.
+            self._vram.end_run(self._runtime_info, self._recent_log_lines)
         self.timer.stop()
         self.start_time = None
         self._runtime_info = {}
@@ -2667,6 +2721,10 @@ class MainWindow(QMainWindow):
             log.info("closeEvent: server stopped")
         self.model_browser.shutdown()
         log.info("closeEvent: model browser stopped")
+        if self._vram is not None:
+            # A QThread destroyed while it runs takes the process down with it.
+            self._vram.shutdown()
+            log.info("closeEvent: vram monitor stopped")
         if hasattr(self, '_startup_worker') and self._startup_worker is not None:
             self._startup_worker.quit()
             self._startup_worker.wait(2000)
@@ -3076,6 +3134,8 @@ class MainWindow(QMainWindow):
             self.btn_gguf_inspect.setToolTip(t("请先选择 .gguf 模型"))
 
         self._update_model_meta(model_path)
+        if self._vram is not None:
+            self._vram.model_changed()
 
     # ------------------------------------------------------------------
     # GGUF quick-metadata row (arch · max ctx)

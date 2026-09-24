@@ -241,7 +241,7 @@ KVMEM = Engine(
     probe_version=False,        # rejected: `unknown flag: --version`
     probe_devices=False,        # rejected: `unknown flag: --list-devices`
     supports=frozenset({"identity_file", "param_linkage",
-                        "error_classification"}),
+                        "error_classification", "vram_prediction"}),
     read_identity=kvmem_identity.read_identity,
     describe_identity=kvmem_identity.describe,
 )
