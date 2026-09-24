@@ -233,6 +233,10 @@ class VramPredictor(QObject):
         self._geometry = None
         self._mmproj_geometry = None
         self._fingerprint = ""
+        #: The two files `_geometry` describes (empty while pending/failed).
+        self._geometry_source = ("", "")
+        #: Raw message of the last failed parse; "" when nothing went wrong.
+        self._geometry_error = ""
         self._seq = 0
         self._worker = None
         self._sample = None
@@ -265,7 +269,23 @@ class VramPredictor(QObject):
         self._window.advanced_panel._retranslate_extras.append(lambda _p: self.retranslate())
         self._monitor.start()
         self.request_geometry()
+        self._watch_model_control()
         return True
+
+    def _watch_model_control(self):
+        """Re-parse when a model or mmproj arrives without a browser click.
+
+        The window's own "the model row changed" hub is `_update_model_info()`,
+        and it is reached from the browser's click and from `--ctx-size` — not
+        from a preset restored at startup, which writes `-m` straight into the
+        widget. Without this the card sits on 正在解析模型结构… for the whole
+        session, because at install() time the model really is not there yet.
+        """
+        for key in ("model", "mmproj"):
+            changed = getattr(self._window.advanced_panel.param_widget(key),
+                              "textChanged", None)
+            if changed is not None:
+                changed.connect(lambda _text: self.request_geometry())
 
     def shutdown(self):
         self._monitor.stop_polling()
@@ -319,12 +339,18 @@ class VramPredictor(QObject):
     def model_changed(self):
         self.request_geometry()
 
+    def _pending_note(self) -> str:
+        """Why the card still has no numbers. A failure is not "still working"."""
+        if self._geometry_error:
+            return t("模型结构解析失败：{m}", m=self._geometry_error)
+        return t("正在解析模型结构…")
+
     # -- prediction ------------------------------------------------------
     def refresh(self):
         if self._panel is None:
             return
         if self._geometry is None:
-            self._panel.set_note(t("正在解析模型结构…"))
+            self._panel.set_note(self._pending_note())
             return
         values = self._read_values() or {}
         inp = self._inputs(values)
@@ -441,14 +467,19 @@ class VramPredictor(QObject):
         self._geometry = geometry
         self._mmproj_geometry = mmproj_geometry
         self._fingerprint = fingerprint
+        self._geometry_error = ""
         self.refresh()
 
     def _on_geometry_err(self, seq, msg):
         if seq != self._seq:
             return
         self._geometry = None
+        # The path is released again so the next edit retries: a file that was
+        # locked by a running server is worth a second look.
+        self._geometry_source = ("", "")
+        self._geometry_error = msg[:160]
         if self._panel is not None:
-            self._panel.set_note(t("模型结构解析失败：{m}", m=msg[:160]))
+            self._panel.set_note(self._pending_note())
 
     def _on_apply_budget(self, budget):
         """The only place this feature writes a parameter — on the user's click."""
@@ -502,13 +533,23 @@ class VramPredictor(QObject):
         self._seq += 1
         seq = self._seq
         model = self._abs(values.get("model"))
+        mmproj = self._abs(values.get("mmproj"))
         if not model:
             self._geometry = None
+            self._geometry_source = ("", "")
+            self._geometry_error = ""
             self._fingerprint = ""
             if self._panel is not None:
                 self._panel.set_note(t("尚未选择模型文件"))
             return
-        worker = _GeometryWorker(seq, model, self._abs(values.get("mmproj")), self)
+        if (model, mmproj) == self._geometry_source:
+            # The same two files: `textChanged` also fires when a preset re-writes
+            # a path the card already parsed, and a parse thread per keystroke of
+            # a typed path is not what the KV geometry needs.
+            return
+        self._geometry_source = (model, mmproj)
+        self._geometry_error = ""
+        worker = _GeometryWorker(seq, model, mmproj, self)
         worker.finished_ok.connect(self._on_geometry)
         worker.finished_err.connect(self._on_geometry_err)
         worker.finished.connect(lambda: _active_geometry_workers.discard(worker))

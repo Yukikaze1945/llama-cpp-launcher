@@ -21,6 +21,7 @@ from contextlib import ExitStack
 import pytest
 
 from PyQt6.QtCore import QObject
+from PyQt6.QtWidgets import QLineEdit
 
 from core import vram_estimator as ve
 from core import vram_learning as vl
@@ -79,6 +80,8 @@ class FakeAdvanced:
         self.mounted = None
         self._retranslate_extras = []
         self.budget = FakeBudgetWidget()
+        self.model_edit = None
+        self.mmproj_edit = None
         self.tabs = None
 
     def add_tab_header(self, key, widget):
@@ -88,7 +91,8 @@ class FakeAdvanced:
         return True
 
     def param_widget(self, key):
-        return self.budget if key == "kvmem_budget" else None
+        return {"kvmem_budget": self.budget, "model": self.model_edit,
+                "mmproj": self.mmproj_edit}.get(key)
 
 
 class FakeWindow(QObject):
@@ -165,6 +169,32 @@ def predictor(tmp_path, monkeypatch, request):
                              source="nvml")
     p._monitor.status = "nvml"
     store.saves = 0
+    return p
+
+
+@pytest.fixture
+def watched_predictor(tmp_path, monkeypatch, request):
+    """A predictor on a window that really owns the model line edit.
+
+    `predictor` answers param_widget("model") with None — the case of a page
+    without that control — so the watch that a restored preset depends on can
+    only be exercised against a live Qt signal.
+    """
+    stack = ExitStack()
+    stack.enter_context(silenced_qt_method(vm.VramMonitor, "start"))
+    stack.enter_context(silenced_qt_method(vm._GeometryWorker, "start"))
+    request.addfinalizer(stack.close)
+    store = vl.VramLearningStore(tmp_path / "vram_learning.json")
+    monkeypatch.setattr(vm.vl, "read_state", lambda path=None: store)
+    window = FakeWindow()
+    window.advanced_panel.model_edit = QLineEdit()
+    window.advanced_panel.mmproj_edit = QLineEdit()
+    # Like the real panel, the window reads these controls back as parameters.
+    for edit, key in ((window.advanced_panel.model_edit, "model"),
+                      (window.advanced_panel.mmproj_edit, "mmproj")):
+        edit.textChanged.connect(lambda text, k=key: window.values.__setitem__(k, text))
+    p = vm.VramPredictor(window, window._get_current_values)
+    assert p.install() is True
     return p
 
 
@@ -531,7 +561,73 @@ def test_a_failed_parse_clears_the_geometry_and_explains_itself(predictor):
     assert "模型结构解析失败" in predictor._panel.note.text()
     assert "not a GGUF file" in predictor._panel.note.text()
     predictor.refresh()
-    assert predictor._panel.note.text() == "正在解析模型结构…"
+    # A refresh must not turn a finished failure back into "still working". That
+    # repaint is what made a card that would never fill in look like a slow one.
+    assert "模型结构解析失败" in predictor._panel.note.text()
+    assert predictor._panel.note.text() != "正在解析模型结构…"
+
+
+def test_a_model_written_without_a_click_still_gets_parsed(watched_predictor,
+                                                           tmp_path):
+    """The startup path the packaged launcher actually takes.
+
+    `_restore_last_preset()` writes `-m` into the line edit after the card was
+    installed, and only the browser's click and `--ctx-size` reach
+    `_update_model_info()` — so before the watch, the exe's card sat on
+    正在解析模型结构… for the whole session.
+    """
+    p = watched_predictor
+    model = tmp_path / "m.gguf"
+    model.write_bytes(b"GGUF")
+    before = p._seq
+    p._window.advanced_panel.model_edit.setText(str(model))
+    assert p._seq == before + 1
+    assert p._worker is not None
+    assert p._geometry_source == (str(model), "")
+
+
+def test_the_same_file_is_not_parsed_again_for_another_parameter(watched_predictor,
+                                                                tmp_path):
+    p = watched_predictor
+    model = tmp_path / "m.gguf"
+    model.write_bytes(b"GGUF")
+    p._window.advanced_panel.model_edit.setText(str(model))
+    worker = p._worker
+    p.model_changed()                       # e.g. a --ctx-size refresh
+    assert p._worker is worker              # no second thread for the same files
+    other = tmp_path / "n.gguf"
+    other.write_bytes(b"GGUF")
+    p._window.advanced_panel.model_edit.setText(str(other))
+    assert p._worker is not worker
+
+
+def test_a_late_mmproj_is_parsed_too(watched_predictor, tmp_path):
+    """--mmproj restored with the preset reaches the vision-tower estimate: the
+    model path never changes, so only the pair can say the request is new."""
+    p = watched_predictor
+    model = tmp_path / "m.gguf"
+    model.write_bytes(b"GGUF")
+    p._window.advanced_panel.model_edit.setText(str(model))
+    worker = p._worker
+    mmproj = tmp_path / "v.gguf"
+    mmproj.write_bytes(b"GGUF")
+    p._window.advanced_panel.mmproj_edit.setText(str(mmproj))
+    assert p._worker is not worker
+    assert p._geometry_source == (str(model), str(mmproj))
+
+
+def test_a_failed_parse_releases_the_file_so_the_next_edit_retries(watched_predictor,
+                                                                  tmp_path):
+    p = watched_predictor
+    model = tmp_path / "m.gguf"
+    model.write_bytes(b"GGUF")
+    p._window.values["model"] = str(model)
+    p.request_geometry()
+    first = p._worker
+    p._on_geometry_err(p._seq, "locked by the server")
+    assert p._geometry_source == ("", "")
+    p.request_geometry()
+    assert p._worker is not first             # retried, not swallowed
 
 
 # --------------------------------------------------------------------------
