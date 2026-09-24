@@ -239,6 +239,8 @@ class VramPredictor(QObject):
         self._geometry_error = ""
         self._seq = 0
         self._worker = None
+        #: shutdown() already severed a hung thread's links; see shutdown().
+        self._threads_cut = False
         self._sample = None
         self._build_id = ""
         self._saw_ready = False
@@ -288,11 +290,32 @@ class VramPredictor(QObject):
                 changed.connect(lambda _text: self.request_geometry())
 
     def shutdown(self):
+        """Stop both threads; sever the signals of any that outlived its wait().
+
+        A QThread destroyed while it runs takes the process down with it, so a
+        parse that is still going after 3 s is left to `_active_geometry_workers`
+        rather than dropped — which means the sender outlives this window, and a
+        late emit from it into a receiver chain that is being destroyed is the
+        same native-crash class `main.py` now guards at exit. ui/main_window.py's
+        closeEvent cuts the startup probe's links for exactly that reason; this
+        is the card's copy of the rule. One flag for both threads because
+        `QObject.disconnect()` with no arguments raises once nothing is
+        connected, and a shutdown() that raises inside closeEvent leaves the
+        window open.
+        """
         self._monitor.stop_polling()
         self._monitor.wait(2000)
         worker = self._worker
         if worker is not None and worker.isRunning():
             worker.wait(3000)
+        if self._threads_cut:
+            return
+        if self._monitor.isRunning() or (worker is not None and worker.isRunning()):
+            self._threads_cut = True
+            self._monitor.disconnect()
+            if worker is not None:
+                worker.disconnect()
+                self._worker = None      # a second shutdown() must not re-cut it
 
     def retranslate(self):
         if self._panel is not None:

@@ -839,6 +839,68 @@ def test_shutdown_leaves_no_thread_behind(predictor):
     predictor.shutdown()
 
 
+def _pretend_hung(thread):
+    """Answer like a QThread that outlived shutdown()'s wait(): still running,
+    and a wait() that times out. The fixtures never start a real thread, so this
+    is how the timeout branch is reached without a model to parse."""
+    thread.isRunning = lambda: True
+    thread.wait = lambda _ms: False
+
+
+def test_a_thread_that_shut_down_cleanly_keeps_talking(predictor):
+    """The cut belongs to the timeout branch only.
+
+    Without this, `disconnect()` at the top of shutdown() would also pass every
+    test below, and it would drop the last samples of a normal run.
+    """
+    predictor.shutdown()
+    sample = vs.GpuMemory(total_bytes=24 * GIB, free_bytes=22 * GIB,
+                          used_bytes=2 * GIB, name="RTX 4090", source="nvml")
+    predictor._monitor.sample_ready.emit(sample)
+    assert predictor._sample is sample
+
+
+def test_a_sampler_that_outlives_the_wait_loses_its_links(predictor):
+    """An emit from a still-running sampler into a dying window is a native crash,
+    and the sampler is kept alive by the window's own reference, so the only way
+    to defuse it is to sever the connection."""
+    before = predictor._sample
+    _pretend_hung(predictor._monitor)
+
+    predictor.shutdown()
+
+    predictor._monitor.sample_ready.emit(
+        vs.GpuMemory(total_bytes=24 * GIB, free_bytes=1 * GIB,
+                     used_bytes=23 * GIB, name="RTX 4090", source="nvml"))
+    assert predictor._sample is before
+    predictor.shutdown()                # cutting twice must not raise in closeEvent
+
+
+def test_a_parse_thread_that_outlives_the_wait_loses_its_links(watched_predictor,
+                                                              tmp_path):
+    """The case the 3 s is there for: `parse_gguf` on a big tensor table, or a
+    model file a running server still holds open. The worker then stays in
+    `_active_geometry_workers` past this window's death."""
+    p = watched_predictor
+    model = tmp_path / "m.gguf"
+    model.write_bytes(b"GGUF")
+    p._window.advanced_panel.model_edit.setText(str(model))
+    worker = p._worker
+    assert worker is not None
+    p._geometry = _geometry()
+    p._fingerprint = "qwen35-64-1234"
+    geometry, fingerprint = p._geometry, p._fingerprint
+    _pretend_hung(worker)
+
+    p.shutdown()
+
+    assert p._worker is None
+    worker.finished_ok.emit(p._seq, _geometry(block_count=1), None, "late-fingerprint")
+    assert p._geometry is geometry
+    assert p._fingerprint == fingerprint
+    p.shutdown()
+
+
 def test_model_changed_asks_for_a_fresh_geometry_without_blocking(predictor):
     before = predictor._seq
     predictor.model_changed()
