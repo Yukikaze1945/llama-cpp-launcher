@@ -119,6 +119,24 @@ def _log_exit_state(app: QApplication):
         logging.getLogger("shutdown").exception("exit-state logging failed")
 
 
+def _teardown_widget_tree(app):
+    """Delete every top-level widget while the QApplication is still alive.
+
+    Interpreter teardown otherwise interleaves the window's and the app's C++
+    destructor chains (the race tests/conftest.py pins), and with the KVMem VRAM
+    card on the parameter page that faulted inside sip's wrapper cast on 2-8 of
+    12 launches. After this returns topLevelWidgets() is empty and the tree is
+    gone: 28 consecutive clean exits with the card mounted, 8 with it off.
+
+    `sendPostedEvents` is what does the deleting — nothing services the
+    deferred-delete queue once exec() has returned, so processEvents() alone
+    leaves every widget alive.
+    """
+    for top in app.topLevelWidgets():
+        top.deleteLater()
+    app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
 def main():
     _setup_logging()
     set_language(load_language())
@@ -152,18 +170,7 @@ def main():
     window.show()
     rc = app.exec()
     _log_exit_state(app)
-    # Delete the widgets here instead of letting ~QApplication do it. Interpreter
-    # teardown interleaves the window's and the app's C++ destructor chains (the
-    # race tests/conftest.py pins), and with the KVMem VRAM card on the parameter
-    # page that faulted inside sip's wrapper cast on 2-8 of 12 launches. After the
-    # flush below topLevelWidgets() is empty and the tree dies while the app is
-    # still alive: 28 consecutive clean exits with the card mounted, 8 with it
-    # off. Nothing else services the deferred-delete queue once exec() has
-    # returned, so sendPostedEvents() is what deletes - processEvents() alone
-    # leaves every widget alive.
-    for _top in app.topLevelWidgets():
-        _top.deleteLater()
-    app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    _teardown_widget_tree(app)
     sys.exit(rc)
 
 
