@@ -90,8 +90,8 @@ _RULES = (
      lambda m, line: t("参数 {flag} 后面缺少取值。", flag=m.group(1))),
     (re.compile(r"incompatible KV cache types:\s*K=(\S+?),\s*V=(\S+)"),
      lambda m, line: "cache_type_v",
-     lambda m, line: t("量化 K 必须配同值的 V：K={k} 时 V 也得是 {k}"
-                       "（把 -ctv 改成同一种类型，或两边都留空跟随 --kv-dtype）。",
+     lambda m, line: t("量化缓存类型必须两侧同值：K={k} / V={v}"
+                       "（把两侧设成同一种类型，或都留空跟随 --kv-dtype）。",
                        k=m.group(1).rstrip(';.'), v=m.group(2).rstrip(';.'))),
     (re.compile(r"unsupported MTP cache type"),
      lambda m, line: "spec_kv_dtype",

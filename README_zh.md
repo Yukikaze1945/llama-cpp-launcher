@@ -155,8 +155,9 @@ python main.py          # Windows 下也可双击 run.bat
 parser：**碰到第一个不满就 exit 1，之后什么可读的都不打**。
 
 - **启动前** —— 每个取值都按这个二进制真正强制的范围、配对与互斥规则校验
-  （量化 `-ctk` 必须配同值 `-ctv`、`--chat-template` 与 `--chat-template-file`
-  互斥、`--chat-template-kwargs` 必须是 JSON object …）。不通过就弹窗点名参数
+  （K 与 V 只要有一侧是量化类型就必须同值、`--chat-template` 与
+  `--chat-template-file` 互斥、`--chat-template-kwargs` 必须是 JSON object …）
+  。不通过就弹窗点名参数
   并跳到它所在的标签页，而不是去启一个必死的进程。
 - **异常退出后** —— 把这次运行的输出与从发布二进制里逐条量出来的 17 条报错文案
   比对，于是 `unknown flag: --parallel` 会变成

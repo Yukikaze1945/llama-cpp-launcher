@@ -1209,7 +1209,7 @@ _EN = {
     "K 缓存类型 (-ctk):": "K cache type (-ctk):",
     "留空 = 跟随 --kv-dtype；量化类型时 V 会被同步为同值": "Empty = follow --kv-dtype; with a quantized type V is locked to the same value",
     "V 缓存类型 (-ctv):": "V cache type (-ctv):",
-    "留空 = 跟随 --kv-dtype": "Empty = follow --kv-dtype",
+    "留空 = 跟随 --kv-dtype；任一侧为量化类型时 K 与 V 必须相同": "Empty = follow --kv-dtype; with a quantized type on either side, K and V must match",
     "投机解码类型 (--spec-type):": "Speculative type (--spec-type):",
     "draft-mtp 需要模型自带 nextn/MTP 头，否则引擎会拒绝": "draft-mtp needs a model with fused nextn/MTP heads, otherwise the engine rejects it",
     "MTP KV 类型 (--spec-kv-dtype):": "MTP KV type (--spec-kv-dtype):",
@@ -1294,7 +1294,7 @@ _EN = {
     "取值不得大于 {hi}（当前 {v}）": "must not be above {hi} (currently {v})",
     "不能留空，只能是 {items} 之一": "cannot be left empty, must be one of {items}",
     "取值只能是 {items} 之一（当前 {v}）": "must be one of {items} (currently {v})",
-    "K 缓存为量化类型 {k} 时 V 必须与之相同（当前 {v}）": "with a quantized K cache type {k}, V must match it (currently {v})",
+    "K 与 V 只要有任一侧是量化类型就必须相同（当前 K={k} / V={v}）": "if either cache type is quantized, K and V must be the same (currently K={k} / V={v})",
     "（空）": "(empty)",
     "none 会关闭思考，与「开启思考」互斥": "none switches thinking off, which conflicts with Thinking on",
     "不能同时发送 --enable-thinking 与 --no-think": "--enable-thinking and --no-think cannot both be sent",
@@ -1324,9 +1324,9 @@ _EN = {
         "That is a llama.cpp server flag; {engine} has no equivalent feature.",
     "服务器不认识参数 {flag}。{hint}": "The server does not recognise {flag}. {hint}",
     "参数 {flag} 后面缺少取值。": "{flag} is missing its value.",
-    "量化 K 必须配同值的 V：K={k} 时 V 也得是 {k}（把 -ctv 改成同一种类型，或两边都留空跟随 --kv-dtype）。":
-        "a quantized K needs an identical V: with K={k}, V must be {k} too "
-        "(set -ctv to the same type, or leave both empty to follow --kv-dtype).",
+    "量化缓存类型必须两侧同值：K={k} / V={v}（把两侧设成同一种类型，或都留空跟随 --kv-dtype）。":
+        "a quantized cache type needs both sides identical: K={k} / V={v} "
+        "(set both to the same type, or leave both empty to follow --kv-dtype).",
     "--spec-kv-dtype 只接受 f16 / q8_0 / q5_0 / q4_0 / f32。":
         "--spec-kv-dtype accepts only f16 / q8_0 / q5_0 / q4_0 / f32.",
     "KV 缓存类型只接受 f16 / f32 / q8_0 / q5_0 / q4_0（没有 bf16）。":

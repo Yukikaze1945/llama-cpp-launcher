@@ -281,6 +281,34 @@ def test_reasoning_effort_none_still_collides_with_thinking_on():
         assert "reasoning_effort" not in dict(K.validate_params(values))
 
 
+def test_kv_pairing_rejects_a_quantized_v_too():
+    """Rule 3 tested only the K side, so `K=f16 + V=q4_0` passed the pre-flight
+    and then died on the server.
+
+    Measured 2026-10-02 against v0.16.0-rc2 with no model loaded: `-ctk q8_0
+    -ctv q4_0`, `-ctk f16 -ctv q4_0` and `-ctk f32 -ctv q8_0` each print
+    "incompatible KV cache types: K=…, V=…; quantized K/V must match" and exit,
+    so the rule is symmetric — a quantized type on *either* side pins the other.
+    """
+    for kv_dtype, k, v in (("q8_0", "q8_0", "q4_0"),   # quantized K
+                           ("f16", "f16", "q4_0"),     # quantized V, explicit
+                           ("q8_0", "f32", "")):       # V from --kv-dtype, K set
+        values = dict(K.fallback_defaults(), kv_dtype=kv_dtype,
+                      cache_type_k=k, cache_type_v=v)
+        assert "cache_type_v" in dict(K.validate_params(values)), (kv_dtype, k, v)
+
+
+def test_matching_kv_pairing_passes():
+    """The other half: every same-type pair, including both sides empty (they
+    then follow --kv-dtype together), must reach the command line."""
+    for kv_dtype, k, v in (("q8_0", "", ""), ("q4_0", "q4_0", "q4_0"),
+                           ("f16", "f16", "f16"), ("f32", "f32", "f32"),
+                           ("f16", "", "f16")):
+        values = dict(K.fallback_defaults(), kv_dtype=kv_dtype,
+                      cache_type_k=k, cache_type_v=v)
+        assert "cache_type_v" not in dict(K.validate_params(values)), (kv_dtype, k, v)
+
+
 def test_schema_i18n_coverage():
     missing = [s for s in K.schema_i18n_strings()
                if _CJK.search(s) and s not in I._EN]

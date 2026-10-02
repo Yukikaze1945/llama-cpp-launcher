@@ -158,8 +158,9 @@ is a hand-written argv parser that exits `1` on its first complaint and prints
 nothing readable afterwards:
 
 - **before starting** — every value is checked against the ranges, pairings and
-  exclusions that binary really enforces (quantized `-ctk` requires an
-  identical `-ctv`, `--chat-template` excludes `--chat-template-file`,
+  exclusions that binary really enforces (a quantized cache type on *either*
+  side forces K and V to be identical, `--chat-template` excludes
+  `--chat-template-file`,
   `--chat-template-kwargs` must be a JSON object, …). A rejected value opens a
   dialog naming the parameter and jumps to its tab, instead of launching a
   process doomed to exit.

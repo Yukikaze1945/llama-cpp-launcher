@@ -286,7 +286,7 @@ PARAMS = (
       label='V 缓存类型 (-ctv):', wattr='adv_cache_type_v', widget='combo',
       default='', emit='diff_nonempty', fmt='str', flag='-ctv',
       flags=('-ctv', '--cache-type-v'), parser='str', items=KVMEM_CTK_TYPE_ITEMS,
-      curtext="", tooltip="留空 = 跟随 --kv-dtype"),
+      curtext="", tooltip="留空 = 跟随 --kv-dtype；任一侧为量化类型时 K 与 V 必须相同"),
     P(key='spec_type', tab='kvmem', row=17,
       label='投机解码类型 (--spec-type):', wattr='adv_spec_type', widget='combo',
       default='none', emit='diff_skip', fmt='str', flag='--spec-type',
@@ -562,10 +562,13 @@ NO_CONTROL_KEYS = {
                "合并成复选框会在取消勾选时发出被拒的 --no-jinja",
 }
 
-#: Cache types whose K forces V to be identical (measured: `--kv-dtype f32
-#: -ctk q8_0` -> "incompatible KV cache types", fatal; the reverse order
-#: passes, and a lone `-ctk q8_0` passes only because V falls back to
-#: --kv-dtype's own q8_0).
+#: Cache types that force the K/V pair to be identical. The engine compares both
+#: sides, not just K (measured 2026-10-02 against v0.16.0-rc2 with no model:
+#: `-ctk q8_0 -ctv q4_0`, `-ctk f16 -ctv q4_0` and `-ctk f32 -ctv q8_0` all print
+#: "incompatible KV cache types: K=…, V=…; quantized K/V must match" and exit).
+#: What is order-dependent is only *which* value each side ends up with:
+#: `--kv-dtype f32 -ctk q8_0` is fatal while the reverse argv order passes,
+#: because the later --kv-dtype overwrites K too (PARAMS keeps --kv-dtype first).
 QUANT_CACHE_TYPES = ("q8_0", "q5_0", "q4_0")
 
 #: thinking_mode combo indices (the order of its `items` above).
@@ -642,14 +645,19 @@ def validate_params(values: dict) -> list:
                              items=" / ".join(param.items), v=value))
 
     # 3. KV cache pairing (§5.3). Effective K = -ctk when set, else --kv-dtype;
-    #    same for V. A quantized K with any other V is fatal, so the pair is
-    #    checked rather than each side alone.
+    #    same for V. A quantized type on *either* side is fatal unless the pair
+    #    matches, so both sides are tested — checking only K (as an earlier
+    #    revision did) let `K=f16 V=q4_0` through the pre-flight to die on the
+    #    server. cache_type_v is the control to blame either way, because that is
+    #    what the engine's own remedy names: "set both -ctk and -ctv, or use
+    #    --kv-dtype TYPE to set both".
     kv_dtype = get("kv_dtype") or ""
     eff_k = get("cache_type_k") or kv_dtype
     eff_v = get("cache_type_v") or kv_dtype
-    if eff_k in QUANT_CACHE_TYPES and eff_v != eff_k:
-        bad("cache_type_v", t("K 缓存为量化类型 {k} 时 V 必须与之相同（当前 {v}）",
-                              k=eff_k, v=eff_v or t("（空）")))
+    if eff_k != eff_v and (eff_k in QUANT_CACHE_TYPES or eff_v in QUANT_CACHE_TYPES):
+        bad("cache_type_v", t("K 与 V 只要有任一侧是量化类型就必须相同"
+                              "（当前 K={k} / V={v}）",
+                              k=eff_k or t("（空）"), v=eff_v or t("（空）")))
 
     # 4. thinking tri-state (§5.4): --reasoning-effort none switches thinking
     #    off by itself, so pairing it with "开启思考" is contradictory (and the
